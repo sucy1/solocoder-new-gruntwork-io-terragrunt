@@ -1,0 +1,779 @@
+// Package services provides services
+// that can be run in the background.
+package services
+
+import (
+	"bytes"
+	"context"
+	"crypto/sha256"
+	"encoding/hex"
+	"fmt"
+	"net/http"
+	"os"
+	"path"
+	"path/filepath"
+	"slices"
+	"strings"
+	"sync"
+	"time"
+
+	"errors"
+
+	"github.com/gruntwork-io/terragrunt/internal/tf/cache/helpers"
+	"github.com/gruntwork-io/terragrunt/internal/tf/cache/models"
+	"github.com/gruntwork-io/terragrunt/internal/tf/cliconfig"
+	"github.com/gruntwork-io/terragrunt/internal/tf/getproviders"
+	"github.com/gruntwork-io/terragrunt/internal/util"
+	"github.com/gruntwork-io/terragrunt/internal/vfs"
+	"github.com/gruntwork-io/terragrunt/pkg/log"
+	svchost "github.com/hashicorp/terraform-svchost"
+	"golang.org/x/sync/errgroup"
+)
+
+const (
+	unzipFileMode = os.FileMode(0000)
+
+	retryDelayLockFile = time.Second * 5
+	maxRetriesLockFile = 60
+
+	retryDelayFetchFile = time.Second * 2
+	maxRetriesFetchFile = 5
+
+	providerCacheWarmUpChBufferSize = 100
+
+	// DefaultProviderFileSizeLimit is the maximum total decompressed size for provider archives (1 GB)
+	DefaultProviderFileSizeLimit = 1 << 30 // 1 GiB
+
+	// DefaultProviderFilesLimit is the maximum number of files in a provider archive
+	DefaultProviderFilesLimit = 100
+)
+
+type ProviderCaches []*ProviderCache
+
+func (caches ProviderCaches) Find(target *models.Provider) *ProviderCache {
+	for _, cache := range caches {
+		if cache.Match(target) {
+			return cache
+		}
+	}
+
+	return nil
+}
+
+func (caches ProviderCaches) FindByRequestID(requestID string) ProviderCaches {
+	var foundCaches ProviderCaches
+
+	for _, cache := range caches {
+		if cache.containsRequestID(requestID) {
+			foundCaches = append(foundCaches, cache)
+		}
+	}
+
+	return foundCaches
+}
+
+func (caches ProviderCaches) removeArchive() error {
+	for _, cache := range caches {
+		if err := cache.removeArchive(); err != nil {
+			return err
+		}
+	}
+
+	return nil
+}
+
+type ProviderCache struct {
+	err error
+	*models.Provider
+	*ProviderService
+	started            chan struct{}
+	userProviderDir    string
+	packageDir         string
+	lockfilePath       string
+	archivePath        string
+	signature          []byte
+	documentSHA256Sums []byte
+	requestIDs         []string
+	archiveCached      bool
+	ready              bool
+	mu                 sync.RWMutex
+}
+
+func (cache *ProviderCache) DocumentSHA256Sums(ctx context.Context) ([]byte, error) {
+	if existing := cache.getDocumentSHA256Sums(); existing != nil || cache.SHA256SumsURL == "" {
+		return existing, nil
+	}
+
+	return cache.setDocumentSHA256Sums(ctx)
+}
+
+func (cache *ProviderCache) Signature(ctx context.Context) ([]byte, error) {
+	if existing := cache.getSignature(); existing != nil || cache.SHA256SumsSignatureURL == "" {
+		return existing, nil
+	}
+
+	return cache.setSignature(ctx)
+}
+
+func (cache *ProviderCache) Version() string {
+	return cache.Provider.Version
+}
+
+func (cache *ProviderCache) Address() string {
+	return cache.Provider.Address()
+}
+
+func (cache *ProviderCache) Constraints() string {
+	return cache.Provider.Constraints()
+}
+
+func (cache *ProviderCache) PackageDir() string {
+	return cache.packageDir
+}
+
+// RegistryHashes returns the per-platform hashes supplied by the upstream registry.
+// Returns nil when the registry response did not include the
+// `packages` field, in which case lockfile generation falls back to local h1
+// computation plus the shasums document.
+func (cache *ProviderCache) RegistryHashes() map[string][]getproviders.Hash {
+	if cache.ResponseBody == nil || len(cache.Packages) == 0 {
+		return nil
+	}
+
+	out := make(map[string][]getproviders.Hash, len(cache.Packages))
+
+	for platform, pkg := range cache.Packages {
+		if pkg == nil || len(pkg.Hashes) == 0 {
+			continue
+		}
+
+		hashes := make([]getproviders.Hash, 0, len(pkg.Hashes))
+		for _, h := range pkg.Hashes {
+			hashes = append(hashes, getproviders.Hash(h))
+		}
+
+		out[platform] = hashes
+	}
+
+	if len(out) == 0 {
+		return nil
+	}
+
+	return out
+}
+
+func (cache *ProviderCache) AuthenticatePackage(ctx context.Context) (*getproviders.PackageAuthenticationResult, error) {
+	var (
+		checksum           [sha256.Size]byte
+		documentSHA256Sums []byte
+		signature          []byte
+		err                error
+	)
+
+	if documentSHA256Sums, err = cache.DocumentSHA256Sums(ctx); err != nil || documentSHA256Sums == nil {
+		return nil, err
+	}
+
+	if signature, err = cache.Signature(ctx); err != nil || signature == nil {
+		return nil, err
+	}
+
+	if _, err := hex.Decode(checksum[:], []byte(cache.SHA256Sum)); err != nil {
+		return nil, fmt.Errorf("registry response includes invalid SHA256 hash %q for provider %q: %w", cache.SHA256Sum, cache.Provider, err)
+	}
+
+	checks := []getproviders.PackageAuthentication{
+		getproviders.NewMatchingChecksumAuthentication(documentSHA256Sums, cache.Filename, checksum),
+		getproviders.NewArchiveChecksumAuthentication(checksum),
+	}
+
+	if len(cache.SigningKeys.Keys()) != 0 {
+		checks = append(checks, getproviders.NewSignatureAuthentication(documentSHA256Sums, signature, cache.SigningKeys.Keys()))
+	} else {
+		// `registry.opentofu.org` does not have signatures for some providers.
+		cache.logger.Warnf("Signature validation was skipped due to the registry not containing GPG keys for the provider %s", cache.Provider)
+	}
+
+	return getproviders.PackageAuthenticationAll(checks...).Authenticate(cache.archivePath)
+}
+
+func (cache *ProviderCache) ArchivePath() string {
+	exists, err := vfs.FileExists(cache.ProviderService.FS(), cache.archivePath)
+	if err != nil {
+		cache.logger.Warnf("Error checking archive path %s: %v", cache.archivePath, err)
+		return ""
+	}
+
+	if exists {
+		return cache.archivePath
+	}
+
+	return ""
+}
+
+func (cache *ProviderCache) addRequestID(requestID string) {
+	cache.mu.Lock()
+	defer cache.mu.Unlock()
+
+	cache.requestIDs = append(cache.requestIDs, requestID)
+}
+
+func (cache *ProviderCache) containsRequestID(requestID string) bool {
+	cache.mu.RLock()
+	defer cache.mu.RUnlock()
+
+	return slices.Contains(cache.requestIDs, requestID)
+}
+
+func (cache *ProviderCache) getRequestIDs() []string {
+	cache.mu.RLock()
+	defer cache.mu.RUnlock()
+
+	result := make([]string, len(cache.requestIDs))
+	copy(result, cache.requestIDs)
+
+	return result
+}
+
+func (cache *ProviderCache) isReady() bool {
+	cache.mu.RLock()
+	defer cache.mu.RUnlock()
+
+	return cache.ready
+}
+
+func (cache *ProviderCache) setReady(ready bool) {
+	cache.mu.Lock()
+	defer cache.mu.Unlock()
+
+	cache.ready = ready
+}
+
+func (cache *ProviderCache) getDocumentSHA256Sums() []byte {
+	cache.mu.RLock()
+	defer cache.mu.RUnlock()
+
+	return cache.documentSHA256Sums
+}
+
+func (cache *ProviderCache) setDocumentSHA256Sums(ctx context.Context) ([]byte, error) {
+	cache.mu.Lock()
+	defer cache.mu.Unlock()
+
+	if cache.documentSHA256Sums != nil {
+		return cache.documentSHA256Sums, nil
+	}
+
+	var documentSHA256Sums = new(bytes.Buffer)
+
+	req, err := cache.newRequest(ctx, cache.SHA256SumsURL)
+	if err != nil {
+		return nil, err
+	}
+
+	if err := helpers.Fetch(ctx, req, documentSHA256Sums); err != nil {
+		return nil, fmt.Errorf("failed to retrieve authentication checksums for provider %q: %w", cache.Provider, err)
+	}
+
+	cache.documentSHA256Sums = documentSHA256Sums.Bytes()
+
+	return cache.documentSHA256Sums, nil
+}
+
+func (cache *ProviderCache) getSignature() []byte {
+	cache.mu.RLock()
+	defer cache.mu.RUnlock()
+
+	return cache.signature
+}
+
+func (cache *ProviderCache) setSignature(ctx context.Context) ([]byte, error) {
+	cache.mu.Lock()
+	defer cache.mu.Unlock()
+
+	if cache.signature != nil {
+		return cache.signature, nil
+	}
+
+	var signature = new(bytes.Buffer)
+
+	req, err := cache.newRequest(ctx, cache.SHA256SumsSignatureURL)
+	if err != nil {
+		return nil, err
+	}
+
+	if err := helpers.Fetch(ctx, req, signature); err != nil {
+		return nil, fmt.Errorf("failed to retrieve authentication signature for provider %q: %w", cache.Provider, err)
+	}
+
+	cache.signature = signature.Bytes()
+
+	return cache.signature, nil
+}
+
+// warmUp checks if the required provider already exists in the cache directory, if not:
+// 1. Checks if the required provider exists in the user plugins directory, located at %APPDATA%\terraform.d\plugins on Windows and ~/.terraform.d/plugins on other systems. If so, creates a symlink to this folder. (Some providers are not available for darwin_arm64, in this case we can use https://github.com/kreuzwerker/m1-terraform-provider-helper which compiles and saves providers to the user plugins directory)
+// 2. Downloads the provider from the original registry, unpacks and saves it into the cache directory.
+func (cache *ProviderCache) warmUp(ctx context.Context) error {
+	fs := cache.ProviderService.FS()
+
+	exists, err := vfs.FileExists(fs, cache.packageDir)
+	if err != nil {
+		return err
+	}
+
+	if exists {
+		return nil
+	}
+
+	// vfs.FileExists uses Stat, which follows symlinks. A dangling symlink
+	// (e.g. left over from a previous run that pointed at ~/.terraform.d/plugins
+	// before that directory was moved or deleted) reports as non-existent here
+	// but still trips MkdirAll downstream with "file exists". Remove only the
+	// symlink itself before the download or user-plugin symlink path runs.
+	if err := RemoveStaleSymlink(fs, cache.packageDir); err != nil {
+		return err
+	}
+
+	if err := fs.MkdirAll(filepath.Dir(cache.packageDir), os.ModePerm); err != nil {
+		return err
+	}
+
+	userProviderExists, err := vfs.FileExists(fs, cache.userProviderDir)
+	if err != nil {
+		return err
+	}
+
+	if userProviderExists {
+		cache.logger.Debugf("Create symlink file %s to %s", cache.packageDir, cache.userProviderDir)
+
+		if err := vfs.Symlink(fs, cache.userProviderDir, cache.packageDir); err != nil {
+			return err
+		}
+
+		cache.logger.Infof("Cached %s from user plugins directory", cache.Provider)
+
+		return nil
+	}
+
+	if cache.DownloadURL == "" {
+		return errors.New("not found provider download url")
+	}
+
+	downloadURLIsLocalFile, err := cache.isLocalFile(fs, cache.DownloadURL)
+	if err != nil {
+		return err
+	}
+
+	if downloadURLIsLocalFile {
+		cache.archivePath = cache.DownloadURL
+	} else {
+		if err := util.DoWithRetry(ctx, fmt.Sprintf("Fetching provider %s", cache.Provider), maxRetriesFetchFile, retryDelayFetchFile, cache.logger, log.DebugLevel, func(ctx context.Context) error {
+			req, err := cache.newRequest(ctx, cache.DownloadURL)
+			if err != nil {
+				return err
+			}
+
+			return helpers.FetchToFile(ctx, req, cache.archivePath)
+		}); err != nil {
+			return err
+		}
+
+		cache.archiveCached = true
+	}
+
+	cache.logger.Debugf("Unpack provider archive %s", cache.archivePath)
+
+	if err := vfs.NewZipDecompressor(
+		vfs.WithFileSizeLimit(DefaultProviderFileSizeLimit),
+		vfs.WithFilesLimit(DefaultProviderFilesLimit),
+	).Unzip(
+		cache.logger,
+		fs,
+		cache.packageDir,
+		cache.archivePath,
+		unzipFileMode,
+	); err != nil {
+		return err
+	}
+
+	auth, err := cache.AuthenticatePackage(ctx)
+	if err != nil {
+		return err
+	}
+
+	cache.logger.Infof("Cached %s (%s)", cache.Provider, auth)
+
+	return nil
+}
+
+func (cache *ProviderCache) newRequest(ctx context.Context, url string) (*http.Request, error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+	if err != nil {
+		return nil, err
+	}
+
+	if cache.credsSource == nil {
+		return req, nil
+	}
+
+	hostname := svchost.Hostname(req.URL.Hostname())
+	if creds := cache.credsSource.ForHost(hostname); creds != nil {
+		creds.PrepareRequest(req)
+	}
+
+	return req, nil
+}
+
+// RemoveStaleSymlink removes a dangling symlink at path. A regular file or
+// directory there returns UnexpectedProviderCachePathError without deletion;
+// a missing path returns nil.
+func RemoveStaleSymlink(fs vfs.FS, path string) error {
+	info, err := vfs.Lstat(fs, path)
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return nil
+		}
+
+		return fmt.Errorf("failed to inspect provider package path %q: %w", path, err)
+	}
+
+	if info.Mode()&os.ModeSymlink == 0 {
+		return &UnexpectedProviderCachePathError{Path: path, Mode: info.Mode()}
+	}
+
+	if err := fs.Remove(path); err != nil {
+		return fmt.Errorf("failed to clear stale provider package symlink %q: %w", path, err)
+	}
+
+	return nil
+}
+
+func (cache *ProviderCache) removeArchive() error {
+	fs := cache.ProviderService.FS()
+
+	if cache.archiveCached {
+		exists, err := vfs.FileExists(fs, cache.archivePath)
+		if err != nil {
+			return err
+		}
+
+		if exists {
+			cache.logger.Debugf("Remove provider cached archive %s", cache.archivePath)
+
+			if err := fs.Remove(cache.archivePath); err != nil {
+				return err
+			}
+		}
+	}
+
+	return nil
+}
+
+// isLocalFile checks whether the given path refers to an existing local file.
+// Remote URLs (containing "://") are never checked against the filesystem because
+// on Windows the colon in "https:" is invalid path syntax and causes an error.
+func (cache *ProviderCache) isLocalFile(fs vfs.FS, path string) (bool, error) {
+	if strings.Contains(path, "://") {
+		return false, nil
+	}
+
+	return vfs.FileExists(fs, path)
+}
+
+func (cache *ProviderCache) acquireLockFile(ctx context.Context) (*util.Lockfile, error) {
+	lockfile := util.NewLockfile(cache.lockfilePath)
+
+	if err := cache.ProviderService.FS().MkdirAll(filepath.Dir(cache.lockfilePath), os.ModePerm); err != nil {
+		return nil, err
+	}
+
+	if err := util.DoWithRetry(ctx, "Acquiring lock file "+cache.lockfilePath, maxRetriesLockFile, retryDelayLockFile, cache.logger, log.DebugLevel, func(ctx context.Context) error {
+		return lockfile.TryLock()
+	}); err != nil {
+		return nil, fmt.Errorf("unable to acquire lock file %s (already locked?) try to remove the file manually: %w", cache.lockfilePath, err)
+	}
+
+	return lockfile, nil
+}
+
+// ProviderServiceOption configures a ProviderService.
+type ProviderServiceOption func(*ProviderService)
+
+// WithFS sets the filesystem for file operations.
+// If not set, defaults to the real OS filesystem.
+func WithFS(fs vfs.FS) ProviderServiceOption {
+	return func(ps *ProviderService) {
+		ps.fs = fs
+	}
+}
+
+type ProviderService struct {
+	logger                log.Logger
+	providerCacheWarmUpCh chan *ProviderCache
+	credsSource           *cliconfig.CredentialsSource
+
+	// fs is the filesystem for file operations.
+	fs vfs.FS
+
+	// The path to store unpacked providers. The file structure is the same as terraform plugin cache dir.
+	cacheDir string
+
+	// The path to a predictable temporary directory for provider archives and lock files.
+	tempDir string
+
+	// the user plugins directory, by default: %APPDATA%\terraform.d\plugins on Windows, ~/.terraform.d/plugins on other systems.
+	userCacheDir   string
+	providerCaches ProviderCaches
+	cacheMu        sync.RWMutex
+	cacheReadyMu   sync.RWMutex
+}
+
+// FS returns the configured filesystem.
+func (service *ProviderService) FS() vfs.FS {
+	return service.fs
+}
+
+func NewProviderService(
+	cacheDir,
+	userCacheDir string,
+	credsSource *cliconfig.CredentialsSource,
+	l log.Logger,
+	opts ...ProviderServiceOption,
+) *ProviderService {
+	service := &ProviderService{
+		cacheDir:              cacheDir,
+		userCacheDir:          userCacheDir,
+		providerCacheWarmUpCh: make(chan *ProviderCache, providerCacheWarmUpChBufferSize),
+		credsSource:           credsSource,
+		logger:                l,
+		fs:                    vfs.NewOSFS(),
+	}
+
+	for _, opt := range opts {
+		opt(service)
+	}
+
+	l.Debugf("Provider service initialized with cache dir: %s, user cache dir: %s", cacheDir, userCacheDir)
+
+	return service
+}
+
+func (service *ProviderService) Logger() log.Logger {
+	return service.logger
+}
+
+// WaitForCacheReady returns cached providers that were requested by `terraform init` from the cache server, with an  URL containing the given `requestID` value.
+// The function returns the value only when all cache requests have been processed.
+func (service *ProviderService) WaitForCacheReady(requestID string) ([]getproviders.Provider, error) {
+	service.cacheReadyMu.Lock()
+	defer service.cacheReadyMu.Unlock()
+
+	var (
+		providers []getproviders.Provider
+		errs      []error
+	)
+
+	service.logger.Debugf("Waiting for cache ready with requestID: %s", requestID)
+
+	caches := service.providerCaches.FindByRequestID(requestID)
+	service.logger.Debugf("Found %d caches for requestID: %s", len(caches), requestID)
+
+	// Add debug logging for all provider caches
+	service.logger.Debugf("Total provider caches: %d", len(service.providerCaches))
+
+	for i, cache := range service.providerCaches {
+		service.logger.Debugf("Cache %d: %s, requestIDs: %v, ready: %v, err: %v",
+			i, cache.Provider, cache.getRequestIDs(), cache.isReady(), cache.err)
+	}
+
+	for _, provider := range caches {
+		if provider.err != nil {
+			errs = append(errs, fmt.Errorf("unable to cache provider: %s, err: %w", provider, provider.err))
+			service.logger.Errorf("Provider cache error for %s: %v", provider, provider.err)
+		}
+
+		if provider.isReady() {
+			providers = append(providers, provider)
+			service.logger.Debugf("Provider %s is ready", provider)
+		} else {
+			service.logger.Debugf("Provider %s is not ready yet", provider)
+		}
+	}
+
+	service.logger.Debugf("Returning %d ready providers for requestID: %s", len(providers), requestID)
+
+	return providers, errors.Join(errs...)
+}
+
+// CacheProvider starts caching the given provider using non-blocking approach.
+func (service *ProviderService) CacheProvider(ctx context.Context, requestID string, provider *models.Provider) *ProviderCache {
+	service.cacheMu.Lock()
+	defer service.cacheMu.Unlock()
+
+	service.logger.Debugf("CacheProvider called for %s with requestID: %s", provider, requestID)
+
+	if cache := service.providerCaches.Find(provider); cache != nil {
+		service.logger.Debugf("Found existing cache for provider %s", provider)
+		cache.addRequestID(requestID)
+
+		return cache
+	}
+
+	packageName := fmt.Sprintf("%s-%s-%s-%s-%s", provider.RegistryName, provider.Namespace, provider.Name, provider.Version, provider.Platform())
+
+	cache := &ProviderCache{
+		ProviderService: service,
+		Provider:        provider,
+		started:         make(chan struct{}, 1),
+
+		userProviderDir: filepath.Join(service.userCacheDir, provider.Address(), provider.Version, provider.Platform()),
+		packageDir:      filepath.Join(service.cacheDir, provider.Address(), provider.Version, provider.Platform()),
+		lockfilePath:    filepath.Join(service.tempDir, packageName+".lock"),
+		archivePath:     filepath.Join(service.tempDir, packageName+path.Ext(provider.Filename)),
+	}
+
+	service.logger.Debugf("Sending provider %s to warm up channel", provider)
+
+	select {
+	case service.providerCacheWarmUpCh <- cache:
+		service.logger.Debugf("Successfully sent provider %s to warm up channel", provider)
+		// We need to wait for caching to start and only then release the client (Terraform) requestID. Otherwise, the client may call `WaitForCacheReady()` faster than `service.ReadyMuReady` will be lock.
+		<-cache.started
+		service.providerCaches = append(service.providerCaches, cache)
+		service.logger.Debugf("Added provider %s to provider caches list", provider)
+	case <-ctx.Done():
+		service.logger.Debugf("Context cancelled while trying to cache provider %s", provider)
+	}
+
+	cache.addRequestID(requestID)
+	service.logger.Debugf("Added requestID %s to provider %s", requestID, provider)
+
+	return cache
+}
+
+// GetProviderCache returns the requested provider archive cache, if it exists.
+func (service *ProviderService) GetProviderCache(provider *models.Provider) *ProviderCache {
+	service.cacheMu.RLock()
+	defer service.cacheMu.RUnlock()
+
+	cache := service.providerCaches.Find(provider)
+	if cache != nil && cache.isReady() {
+		return cache
+	}
+
+	return nil
+}
+
+// Run is responsible to handle a new caching requestID and removing temporary files upon completion.
+func (service *ProviderService) Run(ctx context.Context) error {
+	if service.cacheDir == "" {
+		return errors.New("provider cache directory not specified")
+	}
+
+	service.logger.Debugf("Starting provider cache service with cache dir: %q", service.cacheDir)
+
+	if err := service.FS().MkdirAll(service.cacheDir, os.ModePerm); err != nil {
+		return err
+	}
+
+	tempDir, err := util.EnsureTempDir()
+	if err != nil {
+		return err
+	}
+
+	service.tempDir = filepath.Join(tempDir, "providers")
+	service.logger.Debugf("Provider cache service temp dir: %s", service.tempDir)
+
+	var (
+		errs   []error
+		errsMu sync.Mutex
+	)
+
+	errGroup, ctx := errgroup.WithContext(ctx)
+
+	service.logger.Debugf("Provider cache service is ready to process requests")
+
+	for {
+		select {
+		case cache := <-service.providerCacheWarmUpCh:
+			service.logger.Debugf("Received provider cache request for: %s", cache.Provider)
+			errGroup.Go(func() error {
+				err := service.startProviderCaching(ctx, cache)
+				if err == nil {
+					service.logger.Debugf("Successfully started provider caching for %s", cache.Provider)
+					return nil
+				}
+
+				service.logger.Errorf("Failed to start provider caching for %s: %v", cache.Provider, err)
+
+				errsMu.Lock()
+				defer errsMu.Unlock()
+
+				errs = append(errs, err)
+
+				return nil
+			})
+		case <-ctx.Done():
+			service.logger.Debugf("Provider cache service shutting down...")
+
+			if err := errGroup.Wait(); err != nil {
+				errs = append(errs, err)
+			}
+
+			if err := service.providerCaches.removeArchive(); err != nil {
+				errs = append(errs, err)
+			}
+
+			service.logger.Debugf("Provider cache service shutdown complete")
+
+			return errors.Join(errs...)
+		}
+	}
+}
+
+func (service *ProviderService) startProviderCaching(ctx context.Context, cache *ProviderCache) error {
+	service.cacheReadyMu.RLock()
+	defer service.cacheReadyMu.RUnlock()
+
+	service.logger.Debugf("Starting provider caching for: %s", cache.Provider)
+
+	cache.started <- struct{}{}
+
+	// We need to use a locking mechanism between Terragrunt processes to prevent simultaneous write access to the same provider.
+	lockfile, err := cache.acquireLockFile(ctx)
+	if err != nil {
+		service.logger.Errorf("Failed to acquire lock file for %s: %v", cache.Provider, err)
+		return err
+	}
+	defer lockfile.Unlock() //nolint:errcheck
+
+	service.logger.Debugf("Acquired lock file for %s, starting warm up", cache.Provider)
+
+	if cache.err = cache.warmUp(ctx); cache.err != nil {
+		service.logger.Errorf("Failed to warm up provider %s: %v", cache.Provider, cache.err)
+
+		// UnexpectedProviderCachePathError signals that the path holds user
+		// content; RemoveAll here would silently override that contract.
+		var unexpectedPath *UnexpectedProviderCachePathError
+		if !errors.As(cache.err, &unexpectedPath) {
+			if err := service.FS().RemoveAll(cache.packageDir); err != nil {
+				service.logger.Warnf("Failed to clean up package dir %q: %v", cache.packageDir, err)
+			}
+		}
+
+		if cache.archiveCached {
+			if err := service.FS().Remove(cache.archivePath); err != nil {
+				service.logger.Warnf("Failed to clean up archive %q: %v", cache.archivePath, err)
+			}
+		}
+
+		return cache.err
+	}
+
+	cache.setReady(true)
+
+	service.logger.Debugf("Successfully cached provider: %s", cache.Provider)
+
+	return nil
+}

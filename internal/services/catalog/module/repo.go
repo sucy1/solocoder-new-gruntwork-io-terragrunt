@@ -1,0 +1,553 @@
+package module
+
+import (
+	"context"
+	"fmt"
+	"io/fs"
+	"os"
+	"path/filepath"
+	"regexp"
+	"strings"
+	"time"
+
+	"github.com/gruntwork-io/terragrunt/internal/util"
+
+	"github.com/gitsight/go-vcsurl"
+	"github.com/gruntwork-io/terragrunt/internal/cas"
+	"github.com/gruntwork-io/terragrunt/internal/getter"
+	gitpkg "github.com/gruntwork-io/terragrunt/internal/git"
+	"github.com/gruntwork-io/terragrunt/internal/tf"
+	"github.com/gruntwork-io/terragrunt/internal/vexec"
+	"github.com/gruntwork-io/terragrunt/internal/vfs"
+	"github.com/gruntwork-io/terragrunt/pkg/log"
+	"gopkg.in/ini.v1"
+)
+
+const (
+	githubHost            = "github.com"
+	githubEnterpriseRegex = `^(github\.(.+))$`
+	gitlabHost            = "gitlab.com"
+	azuredevHost          = "dev.azure.com"
+	bitbucketHost         = "bitbucket.org"
+	gitlabSelfHostedRegex = `^(gitlab\.(.+))$`
+
+	cloneCompleteSentinel = ".catalog-clone-complete"
+)
+
+var (
+	gitHeadBranchNameReg    = regexp.MustCompile(`^.*?([^/]+)$`)
+	repoNameFromCloneURLReg = regexp.MustCompile(`(?i)^.*?([-a-z0-9_.]+)[^/]*?(?:\.git)?$`)
+
+	modulesPaths = []string{"modules"}
+
+	includedGitFiles = []string{"HEAD", "config"}
+)
+
+type Repo struct {
+	cloneURL       string
+	sourceURL      string
+	path           string
+	rootWorkingDir string
+
+	RemoteURL  string
+	BranchName string
+	LatestTag  string
+
+	casCloneDepth int
+
+	walkWithSymlinks bool
+	allowCAS         bool
+	slowReporting    bool
+	isLocal          bool
+}
+
+// RepoOpts contains parameters for NewRepo.
+type RepoOpts struct {
+	CloneURL         string
+	Path             string
+	RootWorkingDir   string
+	CASCloneDepth    int
+	WalkWithSymlinks bool
+	AllowCAS         bool
+	SlowReporting    bool
+}
+
+// NewRepo constructs a Repo, cloning if needed and parsing .git metadata via
+// fsys. Pass vfs.NewOSFS() for normal operation; tests that pre-populate a
+// fake repo (with .git/config and .git/HEAD) in memory may pass
+// vfs.NewMemMapFS(). Note that performing an actual remote clone (i.e.
+// CloneURL is a URL, not a local path) requires the OS filesystem because
+// the underlying go-getter writes through the real OS.
+func NewRepo(ctx context.Context, l log.Logger, fsys vfs.FS, opts *RepoOpts) (*Repo, error) {
+	if opts == nil {
+		opts = &RepoOpts{}
+	}
+
+	repo := &Repo{
+		cloneURL:         opts.CloneURL,
+		sourceURL:        opts.CloneURL,
+		path:             opts.Path,
+		walkWithSymlinks: opts.WalkWithSymlinks,
+		allowCAS:         opts.AllowCAS,
+		casCloneDepth:    opts.CASCloneDepth,
+		slowReporting:    opts.SlowReporting,
+		rootWorkingDir:   opts.RootWorkingDir,
+	}
+
+	if err := repo.clone(ctx, l, fsys); err != nil {
+		return nil, err
+	}
+
+	if err := repo.parseRemoteURL(l, fsys); err != nil {
+		return nil, err
+	}
+
+	if err := repo.parseBranchName(fsys); err != nil {
+		return nil, err
+	}
+
+	return repo, nil
+}
+
+// FindModules walks the repo via fsys, searches for Terragrunt modules,
+// indexes their README.* files, and returns module instances.
+func (repo *Repo) FindModules(ctx context.Context, l log.Logger, fsys vfs.FS) (Modules, error) {
+	var modules Modules
+
+	// check if root repo path is a module dir
+	if module, err := NewModule(l, repo, ""); err != nil {
+		return nil, err
+	} else if module != nil {
+		modules = append(modules, module)
+	}
+
+	for _, modulesPath := range modulesPaths {
+		modulesPath = filepath.Join(repo.path, modulesPath)
+
+		exists, err := vfs.FileExists(fsys, modulesPath)
+		if err != nil {
+			return nil, err
+		}
+
+		if !exists {
+			continue
+		}
+
+		walkFunc := func(root string, fn fs.WalkDirFunc) error {
+			return vfs.WalkDir(fsys, root, fn)
+		}
+
+		if repo.walkWithSymlinks {
+			walkFunc = util.WalkDirWithSymlinks
+		}
+
+		err = walkFunc(modulesPath,
+			func(dir string, d fs.DirEntry, err error) error {
+				if err != nil {
+					return err
+				}
+
+				if !d.IsDir() {
+					return nil
+				}
+
+				moduleDir, err := filepath.Rel(repo.path, dir)
+				if err != nil {
+					return err
+				}
+
+				moduleDir = filepath.ToSlash(moduleDir)
+
+				if module, err := NewModule(l, repo, moduleDir); err != nil {
+					return err
+				} else if module != nil {
+					modules = append(modules, module)
+				}
+
+				return nil
+			})
+		if err != nil {
+			return nil, err
+		}
+	}
+
+	return modules, nil
+}
+
+var githubEnterprisePatternReg = regexp.MustCompile(githubEnterpriseRegex)
+var gitlabSelfHostedPatternReg = regexp.MustCompile(gitlabSelfHostedRegex)
+
+// ModuleURL returns the URL to view this module in a browser.
+// When the module provided is in a format that is not supported by the catalog, it returns an empty string.
+func (repo *Repo) ModuleURL(moduleDir string) string {
+	if repo.RemoteURL == "" {
+		return filepath.Join(repo.path, moduleDir)
+	}
+
+	remote, err := vcsurl.Parse(repo.RemoteURL)
+	if err != nil {
+		return ""
+	}
+
+	// Simple, predictable hosts
+	switch remote.Host {
+	case githubHost:
+		return fmt.Sprintf("https://%s/%s/tree/%s/%s", remote.Host, remote.FullName, repo.BranchName, moduleDir)
+	case gitlabHost:
+		return fmt.Sprintf("https://%s/%s/-/tree/%s/%s", remote.Host, remote.FullName, repo.BranchName, moduleDir)
+	case bitbucketHost:
+		return fmt.Sprintf("https://%s/%s/browse/%s?at=%s", remote.Host, remote.FullName, moduleDir, repo.BranchName)
+	case azuredevHost:
+		return fmt.Sprintf("https://%s/_git/%s?path=%s&version=GB%s", remote.Host, remote.FullName, moduleDir, repo.BranchName)
+	}
+
+	// // Hosts that require special handling
+	if githubEnterprisePatternReg.MatchString(string(remote.Host)) {
+		return fmt.Sprintf("https://%s/%s/tree/%s/%s", remote.Host, remote.FullName, repo.BranchName, moduleDir)
+	}
+
+	if gitlabSelfHostedPatternReg.MatchString(string(remote.Host)) {
+		return fmt.Sprintf("https://%s/%s/-/tree/%s/%s", remote.Host, remote.FullName, repo.BranchName, moduleDir)
+	}
+
+	return ""
+}
+
+// SourceURL returns the original catalog URL before go-getter transformation.
+func (repo *Repo) SourceURL() string {
+	return repo.sourceURL
+}
+
+// Path returns the local filesystem path of the cloned (or local) repo. It
+// may differ from the path originally passed via RepoOpts because the
+// clone step can nest the working tree inside a repo-named subdirectory.
+func (repo *Repo) Path() string {
+	return repo.path
+}
+
+// CloneURL returns the resolved clone URL after go-getter normalization.
+// This may differ from the URL originally passed via RepoOpts.
+func (repo *Repo) CloneURL() string {
+	return repo.cloneURL
+}
+
+// ResolveLatestTag looks up the latest semver release tag from the remote.
+// The result is stored in LatestTag. If the lookup fails or the repo has no
+// semver tags, LatestTag is left empty. Local catalog sources skip the
+// lookup entirely so a stale or unreachable origin URL in a local working
+// copy can't stall discovery.
+func (repo *Repo) ResolveLatestTag(ctx context.Context, l log.Logger, exec vexec.Exec) {
+	if repo.isLocal {
+		return
+	}
+
+	remote := repo.remoteForTagLookup()
+	if remote == "" {
+		return
+	}
+
+	runner, err := gitpkg.NewGitRunner(exec)
+	if err != nil {
+		l.Debugf("catalog: skip tag lookup: %v", err)
+
+		return
+	}
+
+	tag, err := runner.LatestReleaseTag(ctx, remote)
+	if err != nil {
+		l.Debugf("catalog: failed to resolve latest tag for %q: %v", remote, err)
+
+		return
+	}
+
+	repo.LatestTag = tag
+}
+
+type CloneOptions struct {
+	Context    context.Context
+	SourceURL  string
+	TargetPath string
+}
+
+func (repo *Repo) clone(ctx context.Context, l log.Logger, fsys vfs.FS) error {
+	cloneURL := repo.resolveCloneURL()
+
+	// Handle local directory case
+	if isDir(fsys, cloneURL) {
+		return repo.handleLocalDir(l, cloneURL)
+	}
+
+	// Prepare clone options
+	opts := CloneOptions{
+		SourceURL:  cloneURL,
+		TargetPath: repo.path,
+		Context:    ctx,
+	}
+
+	if err := repo.prepareCloneDirectory(l, fsys); err != nil {
+		return err
+	}
+
+	if repo.cloneCompleted(fsys) {
+		l.Debugf("The repo dir exists and %q exists. Skipping cloning.", cloneCompleteSentinel)
+
+		return nil
+	}
+
+	return repo.performClone(ctx, l, fsys, &opts)
+}
+
+func (repo *Repo) resolveCloneURL() string {
+	if repo.cloneURL == "" {
+		return repo.rootWorkingDir
+	}
+
+	return repo.cloneURL
+}
+
+func (repo *Repo) handleLocalDir(l log.Logger, repoPath string) error {
+	repo.isLocal = true
+
+	if !filepath.IsAbs(repoPath) {
+		absRepoPath := filepath.Join(repo.rootWorkingDir, repoPath)
+		l.Debugf("Converting relative path %q to absolute %q", repoPath, absRepoPath)
+		repo.path = absRepoPath
+
+		return nil
+	}
+
+	repo.path = repoPath
+
+	return nil
+}
+
+func (repo *Repo) prepareCloneDirectory(l log.Logger, fsys vfs.FS) error {
+	if err := fsys.MkdirAll(repo.path, os.ModePerm); err != nil {
+		return err
+	}
+
+	repoName := repo.extractRepoName()
+	repo.path = filepath.Join(repo.path, repoName)
+
+	// Clean up incomplete clones
+	if repo.shouldCleanupIncompleteClone(fsys) {
+		l.Debugf("The repo dir exists but %q does not. Removing the repo dir for cloning from the remote source.", cloneCompleteSentinel)
+
+		if err := fsys.RemoveAll(repo.path); err != nil {
+			return err
+		}
+	}
+
+	return nil
+}
+
+func (repo *Repo) extractRepoName() string {
+	repoName := "temp"
+	if match := repoNameFromCloneURLReg.FindStringSubmatch(repo.cloneURL); len(match) > 0 && match[1] != "" {
+		repoName = match[1]
+	}
+
+	return repoName
+}
+
+func (repo *Repo) shouldCleanupIncompleteClone(fsys vfs.FS) bool {
+	exists, _ := vfs.FileExists(fsys, repo.path)
+	return exists && !repo.cloneCompleted(fsys)
+}
+
+func (repo *Repo) cloneCompleted(fsys vfs.FS) bool {
+	exists, _ := vfs.FileExists(fsys, filepath.Join(repo.path, cloneCompleteSentinel))
+	return exists
+}
+
+func (repo *Repo) performClone(ctx context.Context, l log.Logger, fsys vfs.FS, opts *CloneOptions) error {
+	var clientOpts []getter.Option
+
+	if repo.allowCAS {
+		cloneDepth := repo.casCloneDepth
+		if cloneDepth == 0 {
+			cloneDepth = cas.DefaultCASCloneDepth
+		}
+
+		if err := cas.ValidateCASCloneDepth(cloneDepth); err != nil {
+			return err
+		}
+
+		c, err := cas.New(cas.WithCloneDepth(cloneDepth))
+		if err != nil {
+			return err
+		}
+
+		venv, err := cas.OSVenv()
+		if err != nil {
+			return err
+		}
+
+		cloneOpts := cas.CloneOptions{
+			Dir:              repo.path,
+			IncludedGitFiles: includedGitFiles,
+		}
+
+		clientOpts = append(clientOpts, getter.WithCAS(c, venv, &cloneOpts))
+	}
+
+	client := getter.NewClient(clientOpts...)
+
+	sourceURL, err := tf.ToSourceURL(opts.SourceURL, "")
+	if err != nil {
+		return err
+	}
+
+	repo.cloneURL = sourceURL.String()
+	l.Infof("Cloning repository %q to temporary directory %q", repo.cloneURL, repo.path)
+
+	// Check first if the query param ref is already set
+	q := sourceURL.Query()
+
+	ref := q.Get("ref")
+	if ref == "" {
+		q.Set("ref", "HEAD")
+	}
+
+	sourceURL.RawQuery = q.Encode()
+
+	cloneFunc := func() error {
+		_, err = client.Get(ctx, &getter.Request{
+			Src:     sourceURL.String(),
+			Dst:     repo.path,
+			GetMode: getter.ModeDir,
+		})
+
+		return err
+	}
+
+	if repo.slowReporting {
+		err = util.NotifyIfSlow(ctx, l, util.SpinnerWriter(), time.Second, util.SlowNotifyMsg{
+			Spinner: "Cloning repository " + repo.cloneURL + "...",
+			Done:    "Cloned repository " + repo.cloneURL,
+		}, cloneFunc)
+	} else {
+		err = cloneFunc()
+	}
+
+	if err != nil {
+		return err
+	}
+
+	// Create the sentinel file to indicate that the clone is complete
+	f, err := fsys.Create(filepath.Join(repo.path, cloneCompleteSentinel))
+	if err != nil {
+		return err
+	}
+
+	if err := f.Close(); err != nil {
+		return err
+	}
+
+	return nil
+}
+
+// parseRemoteURL reads the git config `.git/config` and parses the first URL of the remote URLs, the remote name "origin" has the highest priority.
+func (repo *Repo) parseRemoteURL(l log.Logger, fsys vfs.FS) error {
+	gitConfigPath := filepath.Join(repo.path, ".git", "config")
+
+	gitConfigBytes, err := vfs.ReadFile(fsys, gitConfigPath)
+	if err != nil {
+		return fmt.Errorf("the specified path %q is not a git repository (no .git/config file found)", repo.path)
+	}
+
+	l.Debugf("Parsing git config %q", gitConfigPath)
+
+	inidata, err := ini.Load(gitConfigBytes)
+	if err != nil {
+		return err
+	}
+
+	var sectionName string
+
+	for _, name := range inidata.SectionStrings() {
+		if !strings.HasPrefix(name, "remote") {
+			continue
+		}
+
+		sectionName = name
+
+		if sectionName == `remote "origin"` {
+			break
+		}
+	}
+
+	// no git remotes found
+	if sectionName == "" {
+		return nil
+	}
+
+	repo.RemoteURL = inidata.Section(sectionName).Key("url").String()
+	l.Debugf("Remote url: %q for repo: %q", repo.RemoteURL, repo.path)
+
+	return nil
+}
+
+func (repo *Repo) gitHeadfile() string {
+	return filepath.Join(repo.path, ".git", "HEAD")
+}
+
+// parseBranchName reads `.git/HEAD` file and parses a branch name.
+func (repo *Repo) parseBranchName(fsys vfs.FS) error {
+	raw, err := vfs.ReadFile(fsys, repo.gitHeadfile())
+	if err != nil {
+		return fmt.Errorf("the specified path %q is not a git repository (no .git/HEAD file found)", repo.path)
+	}
+
+	if match := gitHeadBranchNameReg.FindStringSubmatch(string(raw)); len(match) > 0 {
+		repo.BranchName = strings.TrimSpace(match[1])
+
+		return nil
+	}
+
+	return fmt.Errorf("could not get branch name for repo %q", repo.path)
+}
+
+// isDir reports whether p exists on fsys and is a directory.
+func isDir(fsys vfs.FS, p string) bool {
+	info, err := fsys.Stat(p)
+	if err != nil {
+		return false
+	}
+
+	return info.IsDir()
+}
+
+// remoteForTagLookup returns a URL suitable for git ls-remote.
+// It prefers RemoteURL (parsed from .git/config) since that's what git
+// originally used to clone. Falls back to cloneURL with go-getter
+// prefixes, subdirectory paths, and query params stripped.
+func (repo *Repo) remoteForTagLookup() string {
+	if repo.RemoteURL != "" {
+		return repo.RemoteURL
+	}
+
+	u := repo.cloneURL
+	if u == "" {
+		return ""
+	}
+
+	// Strip forced getter prefix (e.g. "git::", "s3::")
+	if _, after, ok := strings.Cut(u, "::"); ok {
+		u = after
+	}
+
+	// Strip //subdir suffix that go-getter uses to select a subdirectory.
+	u, _ = getter.SourceDirSubdir(u)
+
+	// Parse the URL so we can cleanly remove query parameters (e.g. "?ref=HEAD").
+	parsed, err := getter.URLParse(u)
+	if err != nil {
+		return u
+	}
+
+	parsed.RawQuery = ""
+	parsed.Fragment = ""
+
+	return parsed.String()
+}

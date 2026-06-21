@@ -1,0 +1,169 @@
+name: Sign Windows Binaries
+
+on:
+  workflow_dispatch:
+    inputs:
+      artifact_pattern:
+        description: 'Pattern for artifacts to download (default: terragrunt_windows_*)'
+        required: false
+        type: string
+        default: 'terragrunt_windows_*'
+      upload_artifact_name:
+        description: 'Name for the uploaded signed artifacts'
+        required: false
+        type: string
+        default: 'windows-signed-files'
+  workflow_call:
+    inputs:
+      artifact_pattern:
+        description: 'Pattern for artifacts to download (default: terragrunt_windows_*)'
+        required: false
+        type: string
+        default: 'terragrunt_windows_*'
+      upload_artifact_name:
+        description: 'Name for the uploaded signed artifacts'
+        required: false
+        type: string
+        default: 'windows-signed-files'
+      skip_build:
+        description: 'Skip the internal build job and sign artifacts uploaded earlier in this workflow run'
+        required: false
+        type: boolean
+        default: true
+
+jobs:
+  build:
+    name: Build (windows/${{ matrix.arch }})
+    if: ${{ inputs.skip_build != true }}
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        arch: [amd64, "386"]
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+
+      - name: Use mise to install dependencies
+        uses: jdx/mise-action@1648a7812b9aeae629881980618f079932869151 # v4.0.1
+        with:
+          version: 2026.5.12
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - id: go-cache-paths
+        run: |
+          echo "go-build=$(go env GOCACHE)" >> "$GITHUB_OUTPUT"
+          echo "go-mod=$(go env GOMODCACHE)" >> "$GITHUB_OUTPUT"
+
+      - name: Go Build Cache
+        uses: actions/cache@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5
+        with:
+          path: ${{ steps.go-cache-paths.outputs.go-build }}
+          key: ${{ runner.os }}-go-build-${{ hashFiles('**/go.sum') }}-windows-${{ matrix.arch }}
+          restore-keys: |
+            ${{ runner.os }}-go-build-
+
+      - name: Go Mod Cache
+        uses: actions/cache@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5
+        with:
+          path: ${{ steps.go-cache-paths.outputs.go-mod }}
+          key: ${{ runner.os }}-go-mod-${{ hashFiles('**/go.sum') }}
+          restore-keys: |
+            ${{ runner.os }}-go-mod-
+
+      - name: Build Terragrunt
+        env:
+          GOOS: windows
+          GOARCH: ${{ matrix.arch }}
+          CGO_ENABLED: 0
+          BUILD_VERSION: ${{ github.ref_name }}
+        run: |
+          OUTPUT="bin/terragrunt_${GOOS}_${GOARCH}.exe"
+          go build -o "${OUTPUT}" \
+            -ldflags "-s -w -X github.com/gruntwork-io/terragrunt/internal/version.Version=${BUILD_VERSION}" \
+            .
+
+      - name: Verify Static Linking
+        env:
+          GOOS: windows
+          GOARCH: ${{ matrix.arch }}
+        run: |
+          OUTPUT="bin/terragrunt_${GOOS}_${GOARCH}.exe"
+          .github/scripts/release/verify-static-binary.sh "${OUTPUT}" "${GOOS}" "${GOARCH}"
+
+      - name: Upload Build Artifact
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: terragrunt_windows_${{ matrix.arch }}
+          path: bin/terragrunt_windows_${{ matrix.arch }}.exe
+
+  sign-windows:
+    name: Sign Windows Binaries
+    needs: build
+    if: always() && (needs.build.result == 'success' || needs.build.result == 'skipped')
+    runs-on: windows-2025
+
+    env:
+      SM_HOST: https://clientauth.one.digicert.com
+      SM_API_KEY: ${{ secrets.WINDOWS_SIGNING_API_KEY }}
+      SM_CLIENT_CERT_PASSWORD: ${{ secrets.WINDOWS_SIGNING_P12_PASSWORD }}
+      SM_KEYPAIR_ALIAS: ${{ secrets.WINDOWS_SIGNING_KEYPAIR_ALIAS }}
+      WINDOWS_SIGNING_P12_BASE64: ${{ secrets.WINDOWS_SIGNING_P12_BASE64 }}
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+
+      - name: Download Windows build artifacts
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          pattern: ${{ inputs.artifact_pattern }}
+          path: artifacts/
+          merge-multiple: true
+
+      - name: Prepare build artifacts
+        shell: pwsh
+        run: .github/scripts/release/prepare-windows-artifacts.ps1 -ArtifactsDirectory artifacts -BinDirectory bin
+
+      - name: Use mise to install dependencies
+        uses: jdx/mise-action@1648a7812b9aeae629881980618f079932869151 # v4.0.1
+        with:
+          version: 2026.5.12
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Install go-winres
+        shell: pwsh
+        run: .github/scripts/release/install-go-winres.ps1
+
+      # Install DigiCert smctl
+      - name: Install DigiCert smctl
+        uses: digicert/code-signing-software-trust-action@fae23a455ba4bde62b64fd7cb2f81ade788f5a95 # v1.2.1
+        with:
+          simple-signing-mode: 'true'
+
+      # Verify smctl is available
+      - name: Verify smctl installation
+        shell: pwsh
+        run: .github/scripts/release/verify-smctl.ps1
+
+      # Restore P12 client certificate and set SM_CLIENT_CERT_FILE
+      - name: Restore P12 client certificate
+        shell: pwsh
+        run: .github/scripts/release/restore-p12-certificate.ps1
+
+      # Sign Windows binaries using external script
+      - name: Sign and patch Windows binaries
+        shell: pwsh
+        run: .github/scripts/release/sign-windows.ps1 -BinDirectory bin
+
+      # Upload Windows binaries (signed amd64 + unsigned 386)
+      - name: Upload Windows Binaries
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: ${{ inputs.upload_artifact_name }}
+          path: |
+            bin/terragrunt_windows_amd64.exe
+            bin/terragrunt_windows_386.exe
+          if-no-files-found: error

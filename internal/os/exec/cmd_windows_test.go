@@ -1,0 +1,95 @@
+//go:build windows
+
+package exec_test
+
+import (
+	"bytes"
+	"errors"
+	"os"
+	"strconv"
+	"testing"
+	"time"
+
+	"github.com/gruntwork-io/terragrunt/internal/util"
+	"github.com/gruntwork-io/terragrunt/internal/vexec"
+	"github.com/gruntwork-io/terragrunt/pkg/log"
+	"github.com/gruntwork-io/terragrunt/test/helpers/logger"
+
+	"github.com/gruntwork-io/terragrunt/internal/os/exec"
+	"github.com/stretchr/testify/assert"
+)
+
+func TestWindowsConsolePrepare(t *testing.T) {
+	t.Parallel()
+
+	stdout := bytes.Buffer{}
+
+	l := log.New(log.WithOutput(&stdout), log.WithLevel(log.DebugLevel))
+
+	// In a test environment, handles are not real console handles,
+	// so PrepareConsole should return false.
+	result := exec.PrepareConsole(l)
+	assert.False(t, result, "PrepareConsole should return false when handles are invalid")
+
+	assert.Contains(t, stdout.String(), "failed to get console mode")
+}
+
+func TestWindowsExitCode(t *testing.T) {
+	t.Parallel()
+
+	l := logger.CreateLogger()
+
+	for i := 0; i <= 255; i++ {
+		cmd := exec.Command(t.Context(), vexec.NewOSExec(), `testdata\test_exit_code.bat`, strconv.Itoa(i))
+		err := cmd.Run(l)
+
+		if i == 0 {
+			assert.NoError(t, err)
+		} else {
+			assert.Error(t, err)
+		}
+		retCode, err := util.GetExitCode(err)
+		assert.NoError(t, err)
+		assert.Equal(t, i, retCode)
+	}
+
+	// assert a non exec.ExitError returns an error
+	err := errors.New("This is an explicit error")
+	retCode, retErr := util.GetExitCode(err)
+	assert.Error(t, retErr, "An error was expected")
+	assert.Equal(t, err, retErr)
+	assert.Equal(t, 0, retCode)
+}
+
+func TestWindowsNewSignalsForwarderWait(t *testing.T) {
+	t.Parallel()
+
+	expectedWait := 5
+
+	l := logger.CreateLogger()
+
+	cmd := exec.Command(t.Context(), vexec.NewOSExec(), `testdata\test_sigint_wait.bat`, strconv.Itoa(expectedWait))
+
+	runChannel := make(chan error)
+
+	go func() {
+		runChannel <- cmd.Run(l)
+	}()
+
+	time.Sleep(time.Second)
+	// start := time.Now()
+	// Note: sending interrupt on Windows is not supported by Windows and not implemented in Go
+	cmd.SendSignal(l, os.Kill)
+
+	err := <-runChannel
+
+	assert.Error(t, err)
+
+	// Since we can't send an interrupt on Windows, our test script won't handle it gracefully and exit after the expected wait time,
+	// so this part of the test process cannot be done on Windows
+	// retCode, err := GetExitCode(err)
+	// assert.NoError(t, err)
+	// assert.Equal(t, retCode, expectedWait)
+	// assert.WithinDuration(t, start.Add(time.Duration(expectedWait)*time.Second), time.Now(), time.Second,
+	// 	"Expected to wait 5 (+/-1) seconds after SIGINT")
+}

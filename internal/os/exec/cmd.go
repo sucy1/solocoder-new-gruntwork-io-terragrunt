@@ -1,0 +1,216 @@
+// Package exec runs external commands. It wraps exec.Cmd package with support for allocating a pseudo-terminal.
+package exec
+
+import (
+	"context"
+	"io"
+	"os"
+	"path/filepath"
+	"sync/atomic"
+	"time"
+
+	"github.com/gruntwork-io/terragrunt/internal/os/signal"
+	"github.com/gruntwork-io/terragrunt/internal/vexec"
+	"github.com/gruntwork-io/terragrunt/pkg/log"
+	"golang.org/x/text/cases"
+	"golang.org/x/text/language"
+
+	"errors"
+)
+
+// DefaultGracefulShutdownDelay is the default time to wait for a process to exit
+// gracefully after sending an interrupt signal before escalating to SIGKILL.
+const DefaultGracefulShutdownDelay = 30 * time.Second
+
+// ErrPTYRequiresOSBackend is returned when a Cmd is started with PTY allocation
+// requested but the underlying vexec.Exec is not OS-backed.
+var ErrPTYRequiresOSBackend = errors.New("PTY allocation requires an OS-backed vexec.Exec")
+
+// Cmd wraps a vexec.Cmd with signal forwarding and optional PTY support.
+// The Cmd may be backed by a real OS process or by an in-memory vexec backend
+// (used in tests and fuzzers to prevent fork of external binaries).
+type Cmd struct {
+	vc                         vexec.Cmd
+	interruptSignal            os.Signal
+	filename                   string
+	dir                        string
+	forwardSignalDelay         time.Duration
+	usePTY                     bool
+	gracefulShutdownRegistered atomic.Bool
+}
+
+// Command returns a `Cmd` configured to execute the named program with
+// the given arguments via the provided vexec.Exec. PTY allocation requires
+// an OS-backed Exec; non-OS backends are accepted but `WithUsePTY(true)`
+// will fail at Start with ErrPTYRequiresOSBackend.
+func Command(ctx context.Context, e vexec.Exec, name string, args ...string) *Cmd {
+	vc := e.Command(ctx, name, args...)
+
+	cmd := &Cmd{
+		vc:              vc,
+		filename:        filepath.Base(name),
+		interruptSignal: signal.InterruptSignal,
+	}
+
+	cmd.SetStdin(os.Stdin)
+	cmd.SetStdout(os.Stdout)
+	cmd.SetStderr(os.Stderr)
+
+	vc.SetWaitDelay(DefaultGracefulShutdownDelay)
+
+	vc.SetCancel(func() error {
+		if cmd.gracefulShutdownRegistered.Load() {
+			return nil
+		}
+
+		sig := signal.SignalFromContext(ctx)
+		if sig == nil {
+			sig = cmd.interruptSignal
+		}
+
+		if sig == nil {
+			sig = os.Kill
+		}
+
+		if err := vc.Signal(sig); err != nil && !errors.Is(err, vexec.ErrProcessNotStarted) {
+			return err
+		}
+
+		return nil
+	})
+
+	return cmd
+}
+
+// SetStdin sets the command's standard input.
+func (cmd *Cmd) SetStdin(r io.Reader) { cmd.vc.SetStdin(r) }
+
+// SetStdout sets the command's standard output.
+func (cmd *Cmd) SetStdout(w io.Writer) { cmd.vc.SetStdout(w) }
+
+// SetStderr sets the command's standard error.
+func (cmd *Cmd) SetStderr(w io.Writer) { cmd.vc.SetStderr(w) }
+
+// SetEnv sets the command's environment in `KEY=value` form.
+func (cmd *Cmd) SetEnv(env []string) { cmd.vc.SetEnv(env) }
+
+// SetDir sets the command's working directory.
+func (cmd *Cmd) SetDir(dir string) {
+	cmd.dir = dir
+	cmd.vc.SetDir(dir)
+}
+
+// Dir returns the working directory previously set via SetDir.
+func (cmd *Cmd) Dir() string { return cmd.dir }
+
+// Configure sets options to the `Cmd`.
+func (cmd *Cmd) Configure(opts ...Option) {
+	for _, opt := range opts {
+		opt(cmd)
+	}
+}
+
+// Start starts the command but does not wait for it to complete. When PTY
+// allocation is requested, the underlying backend must be OS-backed.
+func (cmd *Cmd) Start(l log.Logger) error {
+	if cmd.usePTY {
+		osCmder, ok := cmd.vc.(vexec.OSCmder)
+		if !ok {
+			return ErrPTYRequiresOSBackend
+		}
+
+		return runCommandWithPTY(l, osCmder.OSCmd())
+	}
+
+	if err := cmd.vc.Start(); err != nil {
+		return err
+	}
+
+	return nil
+}
+
+// Wait waits for the command to exit and returns its error.
+func (cmd *Cmd) Wait() error { return cmd.vc.Wait() }
+
+// Run starts the command and waits for it to complete.
+func (cmd *Cmd) Run(l log.Logger) error {
+	if err := cmd.Start(l); err != nil {
+		return err
+	}
+
+	return cmd.Wait()
+}
+
+// RegisterGracefullyShutdown registers a graceful shutdown for the
+// command in two ways:
+//  1. If the context cancel contains a cause with a signal, this means
+//     that Terragrunt received the signal from the OS, since our
+//     executed command may also receive the same signal, we need to
+//     give the command time to gracefully shutting down, to avoid the
+//     command receiving this signal twice. Thus we will send the signal
+//     to the executed command with a delay or immediately if Terragrunt
+//     receives this same signal again.
+//  2. If the context does not contain any causes, this means that there
+//     was some failure and we need to terminate all executed commands,
+//     in this situation we are sure that commands did not receive any
+//     signal, so we send them an interrupt signal immediately.
+func (cmd *Cmd) RegisterGracefullyShutdown(ctx context.Context, l log.Logger) func() {
+	cmd.gracefulShutdownRegistered.Store(true)
+
+	ctxShutdown, cancelShutdown := context.WithCancel(context.Background())
+
+	go func() {
+		select {
+		case <-ctxShutdown.Done():
+		case <-ctx.Done():
+			if cause := new(signal.ContextCanceledError); errors.As(context.Cause(ctx), &cause) && cause.Signal != nil {
+				cmd.ForwardSignal(ctxShutdown, l, cause.Signal)
+
+				return
+			}
+
+			cmd.SendSignal(l, cmd.interruptSignal)
+		}
+	}()
+
+	return cancelShutdown
+}
+
+// ForwardSignal forwards a given `sig` with a delay if cmd.forwardSignalDelay is greater than 0,
+// and if the same signal is received again, it is forwarded immediately.
+func (cmd *Cmd) ForwardSignal(ctx context.Context, l log.Logger, sig os.Signal) {
+	ctxDelay, cancelDelay := context.WithCancel(ctx)
+	defer cancelDelay()
+
+	signal.NotifierWithContext(ctx, func(_ os.Signal) {
+		cancelDelay()
+	}, sig)
+
+	if cmd.forwardSignalDelay > 0 {
+		l.Debugf("%s signal will be forwarded to %s with delay %s",
+			cases.Title(language.English).String(sig.String()),
+			cmd.filename,
+			cmd.forwardSignalDelay,
+		)
+	}
+
+	select {
+	case <-ctx.Done():
+		return
+	case <-time.After(cmd.forwardSignalDelay):
+	case <-ctxDelay.Done():
+	}
+
+	cmd.SendSignal(l, sig)
+}
+
+// SendSignal sends the given `sig` to the executed command. Errors are logged
+// rather than returned; ErrProcessNotStarted is silently ignored because
+// callers may race against process startup.
+func (cmd *Cmd) SendSignal(l log.Logger, sig os.Signal) {
+	l.Debugf("%s signal is forwarded to %s", cases.Title(language.English).String(sig.String()), cmd.filename)
+
+	if err := cmd.vc.Signal(sig); err != nil && !errors.Is(err, vexec.ErrProcessNotStarted) {
+		l.Errorf("Failed to forwarding signal %s to %s: %v", sig, cmd.filename, err)
+	}
+}

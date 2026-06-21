@@ -1,0 +1,286 @@
+package config_test
+
+import (
+	"path/filepath"
+	"testing"
+
+	"github.com/gruntwork-io/terragrunt/internal/experiment"
+	"github.com/gruntwork-io/terragrunt/internal/util"
+	"github.com/gruntwork-io/terragrunt/pkg/config"
+	"github.com/gruntwork-io/terragrunt/pkg/config/hclparse"
+	"github.com/gruntwork-io/terragrunt/test/helpers/logger"
+	"github.com/hashicorp/hcl/v2"
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+	"github.com/zclconf/go-cty/cty"
+	"github.com/zclconf/go-cty/cty/gocty"
+)
+
+func TestDecodeDependencyBlockMultiple(t *testing.T) {
+	t.Parallel()
+
+	cfg := `
+dependency "vpc" {
+  config_path = "../vpc"
+}
+
+dependency "sql" {
+  config_path = "../sql"
+}
+`
+	filename := config.DefaultTerragruntConfigPath
+	file, err := hclparse.NewParser().ParseFromString(cfg, filename)
+	require.NoError(t, err)
+
+	decoded := config.TerragruntDependency{}
+	require.NoError(t, file.Decode(&decoded, &hcl.EvalContext{}))
+
+	assert.Len(t, decoded.Dependencies, 2)
+	assert.Equal(t, "vpc", decoded.Dependencies[0].Name)
+	assert.Equal(t, cty.StringVal("../vpc"), decoded.Dependencies[0].ConfigPath)
+	assert.Equal(t, "sql", decoded.Dependencies[1].Name)
+	assert.Equal(t, cty.StringVal("../sql"), decoded.Dependencies[1].ConfigPath)
+}
+
+func TestDecodeNoDependencyBlock(t *testing.T) {
+	t.Parallel()
+
+	cfg := `
+locals {
+  path = "../vpc"
+}
+`
+	filename := config.DefaultTerragruntConfigPath
+	file, err := hclparse.NewParser().ParseFromString(cfg, filename)
+	require.NoError(t, err)
+
+	decoded := config.TerragruntDependency{}
+	require.NoError(t, file.Decode(&decoded, &hcl.EvalContext{}))
+	assert.Empty(t, decoded.Dependencies)
+}
+
+func TestDecodeDependencyNoLabelIsError(t *testing.T) {
+	t.Parallel()
+
+	cfg := `
+dependency {
+  config_path = "../vpc"
+}
+`
+	filename := config.DefaultTerragruntConfigPath
+	file, err := hclparse.NewParser().ParseFromString(cfg, filename)
+	require.NoError(t, err)
+
+	decoded := config.TerragruntDependency{}
+	require.Error(t, file.Decode(&decoded, &hcl.EvalContext{}))
+}
+
+func TestDecodeDependencyMockOutputs(t *testing.T) {
+	t.Parallel()
+
+	cfg := `
+dependency "hitchhiker" {
+  config_path = "../answers"
+  mock_outputs = {
+    the_answer = 42
+  }
+  mock_outputs_allowed_terraform_commands = ["validate", "apply"]
+}
+`
+	filename := config.DefaultTerragruntConfigPath
+	file, err := hclparse.NewParser().ParseFromString(cfg, filename)
+	require.NoError(t, err)
+
+	decoded := config.TerragruntDependency{}
+	require.NoError(t, file.Decode(&decoded, &hcl.EvalContext{}))
+
+	assert.Len(t, decoded.Dependencies, 1)
+	dependency := decoded.Dependencies[0]
+	assert.Equal(t, "hitchhiker", dependency.Name)
+	assert.Equal(t, cty.StringVal("../answers"), dependency.ConfigPath)
+
+	ctyValueDefault := dependency.MockOutputs
+	assert.NotNil(t, ctyValueDefault)
+
+	var actualDefault struct {
+		TheAnswer int `cty:"the_answer"`
+	}
+	require.NoError(t, gocty.FromCtyValue(*ctyValueDefault, &actualDefault))
+	assert.Equal(t, 42, actualDefault.TheAnswer)
+
+	defaultAllowedCommands := dependency.MockOutputsAllowedTerraformCommands
+	assert.NotNil(t, defaultAllowedCommands)
+	assert.Equal(t, []string{"validate", "apply"}, *defaultAllowedCommands)
+}
+func TestParseDependencyBlockMultiple(t *testing.T) {
+	t.Parallel()
+
+	filename, err := filepath.Abs(filepath.Join("../..", "test", "fixtures", "regressions", "multiple-dependency-load-sync", "main", "terragrunt.hcl"))
+	require.NoError(t, err)
+
+	ctx, pctx := newTestParsingContext(t, filename)
+	err = pctx.Experiments.EnableExperiment(experiment.DependencyFetchOutputFromState)
+	require.NoError(t, err)
+
+	pctx.Env = util.EnvironMap()
+	tfConfig, err := config.ParseConfigFile(ctx, pctx, logger.CreateLogger(), filename, nil)
+	require.NoError(t, err)
+	assert.Len(t, tfConfig.TerragruntDependencies, 2)
+	assert.Equal(t, "dependency_1", tfConfig.TerragruntDependencies[0].Name)
+	assert.Equal(t, "dependency_2", tfConfig.TerragruntDependencies[1].Name)
+}
+
+func TestDisabledDependency(t *testing.T) {
+	t.Parallel()
+
+	cfg := `
+dependency "ec2" {
+  config_path = "../ec2"
+  enabled    = false
+}
+dependency "vpc" {
+  config_path = "../vpc"
+}
+`
+	filename := config.DefaultTerragruntConfigPath
+	file, err := hclparse.NewParser().ParseFromString(cfg, filename)
+	require.NoError(t, err)
+
+	decoded := config.TerragruntDependency{}
+	require.NoError(t, file.Decode(&decoded, &hcl.EvalContext{}))
+	assert.Len(t, decoded.Dependencies, 2)
+}
+
+// TestDisabledDependencyWithNullConfigPath verifies that disabled dependencies
+// with null config_path don't panic during parsing (they bypass validation).
+func TestDisabledDependencyWithNullConfigPath(t *testing.T) {
+	t.Parallel()
+
+	// This config has a disabled dependency with config_path that would fail
+	// validation if it were enabled (uses a local that resolves to null)
+	cfg := `
+locals {
+  disabled_path = null
+}
+
+dependency "disabled" {
+  config_path = local.disabled_path
+  enabled     = false
+}
+
+dependency "enabled" {
+  config_path = "../vpc"
+}
+`
+	l := logger.CreateLogger()
+	ctx, pctx := newTestParsingContext(t, config.DefaultTerragruntConfigPath)
+	pctx = pctx.WithDecodeList(config.DependencyBlock)
+
+	// Should not panic - disabled deps bypass config_path validation
+	terragruntConfig, err := config.PartialParseConfigString(ctx, pctx, l, config.DefaultTerragruntConfigPath, cfg, nil)
+	require.NoError(t, err)
+
+	// Only enabled dependency should be in the paths
+	assert.Len(t, terragruntConfig.Dependencies.Paths, 1)
+}
+
+// TestDependencyOriginalTerragruntDir verifies that when parsing a dependency's
+// config during cycle detection, get_original_terragrunt_dir() returns the
+// dependency's directory, not the caller's directory.
+//
+// Regression test: when unit-a depends on unit-b, and unit-b's config chain
+// calls get_original_terragrunt_dir(), it must resolve to unit-b's directory so
+// that paths constructed from it point to files that exist alongside unit-b.
+func TestDependencyOriginalTerragruntDir(t *testing.T) {
+	t.Parallel()
+
+	filename, err := filepath.Abs(
+		filepath.Join(
+			"../..",
+			"test",
+			"fixtures",
+			"regressions",
+			"dependency-original-terragrunt-dir",
+			"unit-a",
+			"terragrunt.hcl",
+		),
+	)
+	require.NoError(t, err)
+
+	ctx, pctx := newTestParsingContext(t, filename)
+	pctx.OriginalTerragruntConfigPath = filename
+	pctx.SkipOutput = true
+
+	tfConfig, err := config.ParseConfigFile(ctx, pctx, logger.CreateLogger(), filename, nil)
+	require.NoError(t, err)
+	require.NotNil(t, tfConfig)
+
+	// Parse unit-b directly and verify that its locals resolved correctly
+	// through the get_original_terragrunt_dir() -> common.hcl -> _common.hcl chain.
+	unitBFilename, err := filepath.Abs(
+		filepath.Join(
+			"../..",
+			"test",
+			"fixtures",
+			"regressions",
+			"dependency-original-terragrunt-dir",
+			"unit-b",
+			"terragrunt.hcl",
+		),
+	)
+	require.NoError(t, err)
+
+	ctxB, pctxB := newTestParsingContext(t, unitBFilename)
+	pctxB.OriginalTerragruntConfigPath = unitBFilename
+
+	unitBConfig, err := config.ParseConfigFile(ctxB, pctxB, logger.CreateLogger(), unitBFilename, nil)
+	require.NoError(t, err)
+	require.NotNil(t, unitBConfig)
+	assert.Equal(t, "myapp", unitBConfig.Locals["app_name"])
+}
+
+// TestDisabledDependencyWithEmptyConfigPath verifies that disabled dependencies
+// with empty config_path don't cause errors.
+func TestDisabledDependencyWithEmptyConfigPath(t *testing.T) {
+	t.Parallel()
+
+	cfg := `
+dependency "disabled" {
+  config_path = ""
+  enabled     = false
+}
+
+dependency "enabled" {
+  config_path = "../vpc"
+}
+`
+	l := logger.CreateLogger()
+	ctx, pctx := newTestParsingContext(t, config.DefaultTerragruntConfigPath)
+	pctx = pctx.WithDecodeList(config.DependencyBlock)
+
+	// Should not error - disabled deps bypass config_path validation
+	terragruntConfig, err := config.PartialParseConfigString(ctx, pctx, l, config.DefaultTerragruntConfigPath, cfg, nil)
+	require.NoError(t, err)
+
+	// Only enabled dependency should be in the paths
+	assert.Len(t, terragruntConfig.Dependencies.Paths, 1)
+}
+
+// TestExposedIncludeFullParseSurfacesNoOutputsError pins that a full parse of a child
+// config whose exposed include cannot resolve its dependency outputs returns a
+// TerragruntOutputTargetNoOutputs error in the chain.
+func TestExposedIncludeFullParseSurfacesNoOutputsError(t *testing.T) {
+	t.Parallel()
+
+	childPath, err := filepath.Abs(filepath.Join("..", "..", "test", "fixtures", "regressions", "exposed-include-partial-parse-error", "child", "terragrunt.hcl"))
+	require.NoError(t, err)
+
+	ctx, pctx := newTestParsingContext(t, childPath)
+	pctx.Env = util.EnvironMap()
+
+	_, err = config.ParseConfigFile(ctx, pctx, logger.CreateLogger(), childPath, nil)
+	require.Error(t, err)
+
+	var noOutputs config.TerragruntOutputTargetNoOutputs
+	require.ErrorAs(t, err, &noOutputs)
+}

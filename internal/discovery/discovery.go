@@ -1,0 +1,764 @@
+package discovery
+
+import (
+	"context"
+	"path/filepath"
+	"slices"
+	"sync"
+
+	"errors"
+
+	"github.com/gruntwork-io/terragrunt/internal/component"
+	"github.com/gruntwork-io/terragrunt/internal/filter"
+	"github.com/gruntwork-io/terragrunt/internal/shell"
+	"github.com/gruntwork-io/terragrunt/internal/telemetry"
+	"github.com/gruntwork-io/terragrunt/internal/util"
+	"github.com/gruntwork-io/terragrunt/internal/vfs"
+	"github.com/gruntwork-io/terragrunt/pkg/log"
+	"github.com/gruntwork-io/terragrunt/pkg/options"
+
+	"golang.org/x/sync/errgroup"
+)
+
+// Discover performs the full discovery process.
+func (d *Discovery) Discover(
+	ctx context.Context,
+	l log.Logger,
+	opts *options.TerragruntOptions,
+) (component.Components, error) {
+	d.classifier = filter.NewClassifier(d.filters)
+
+	l.Debugf("Discovery: %d filter(s) configured: %s", len(d.filters), d.filters)
+
+	var (
+		results *PhaseResults
+		err     error
+	)
+
+	withWorktree := len(d.gitExpressions) > 0 && d.worktrees != nil
+
+	l.Debugf("Discovery: starting filesystem phase (workers=%d, with_worktree=%t)", d.numWorkers, withWorktree)
+
+	err = telemetry.TelemeterFromContext(ctx).Collect(ctx, "discovery_phase_filesystem", map[string]any{
+		"num_workers":   d.numWorkers,
+		"with_worktree": withWorktree,
+	}, func(childCtx context.Context) error {
+		var phaseErr error
+
+		results, phaseErr = d.runFilesystemPhase(childCtx, l, opts)
+
+		return phaseErr
+	})
+
+	logPhaseComplete(l, "filesystem", results, err)
+
+	if err != nil && (!d.suppressParseErrors || errors.As(err, new(CoexistenceError))) {
+		return nil, err
+	}
+
+	discovered, candidates := results.Discovered, results.Candidates
+
+	parseReasons := slices.Clone(d.parseReasons)
+	if d.classifier.HasParseRequiredFilters() {
+		if !slices.Contains(parseReasons, parseReasonClassifierRequiresParse) {
+			parseReasons = append(parseReasons, parseReasonClassifierRequiresParse)
+		}
+	}
+
+	if len(parseReasons) > 0 {
+		reasonsStr := joinParseReasons(parseReasons)
+
+		l.Debugf("Discovery: starting parse phase (discovered=%d, candidates=%d, reasons=%s)",
+			len(discovered), len(candidates), reasonsStr)
+
+		err = telemetry.TelemeterFromContext(ctx).Collect(ctx, "discovery_phase_parse", map[string]any{
+			"num_workers":       d.numWorkers,
+			"discovered_in":     len(discovered),
+			"candidates_in":     len(candidates),
+			"parse_includes":    d.parseIncludes,
+			"parse_exclude":     d.parseExclude,
+			"read_files":        d.readFiles,
+			"activation_reason": reasonsStr,
+		}, func(childCtx context.Context) error {
+			var phaseErr error
+
+			results, phaseErr = d.runParsePhase(childCtx, l, opts, discovered, candidates)
+
+			return phaseErr
+		})
+
+		logPhaseComplete(l, "parse", results, err)
+
+		if err != nil && !d.suppressParseErrors {
+			return nil, err
+		}
+
+		discovered, candidates = results.Discovered, results.Candidates
+	}
+
+	if d.classifier.HasGraphFilters() {
+		if d.classifier.HasDependentFilters() && d.gitRoot == "" {
+			if gitRootPath, gitErr := shell.GitTopLevelDir(ctx, l, d.exec, opts.Env, d.workingDir); gitErr == nil {
+				d.gitRoot = gitRootPath
+				l.Debugf("Set gitRoot for dependent discovery: %s", d.gitRoot)
+			}
+		}
+
+		l.Debugf("Discovery: starting graph phase (discovered=%d, candidates=%d, max_depth=%d, has_dependent_filters=%t)",
+			len(discovered), len(candidates), d.maxDependencyDepth, d.classifier.HasDependentFilters())
+
+		err = telemetry.TelemeterFromContext(ctx).Collect(ctx, "discovery_phase_graph", map[string]any{
+			"num_workers":           d.numWorkers,
+			"max_dependency_depth":  d.maxDependencyDepth,
+			"discovered_in":         len(discovered),
+			"candidates_in":         len(candidates),
+			"has_dependent_filters": d.classifier.HasDependentFilters(),
+		}, func(childCtx context.Context) error {
+			var phaseErr error
+
+			results, phaseErr = d.runGraphPhase(childCtx, l, opts, discovered, candidates)
+
+			return phaseErr
+		})
+
+		logPhaseComplete(l, "graph", results, err)
+
+		if err != nil && !d.suppressParseErrors {
+			return nil, err
+		}
+
+		discovered = results.Discovered
+	}
+
+	components := resultsToComponents(discovered)
+
+	if d.discoverRelationships {
+		l.Debugf("Discovery: starting relationship phase (components=%d, max_depth=%d)",
+			len(components), d.maxDependencyDepth)
+
+		err = telemetry.TelemeterFromContext(ctx).Collect(ctx, "discovery_phase_relationship", map[string]any{
+			"num_workers":          d.numWorkers,
+			"max_dependency_depth": d.maxDependencyDepth,
+			"components_in":        len(components),
+		}, func(childCtx context.Context) error {
+			var phaseErr error
+
+			components, phaseErr = d.runRelationshipPhase(childCtx, l, opts, components)
+
+			return phaseErr
+		})
+
+		l.Debugf("Discovery: relationship phase complete (components=%d, err=%v)", len(components), err)
+
+		if err != nil && !d.suppressParseErrors {
+			return components, err
+		}
+	}
+
+	if len(d.filters) > 0 {
+		l.Debugf("Discovery: applying %d filter(s) to %d components", len(d.filters), len(components))
+
+		filtered, err := d.filters.Evaluate(l, components)
+		if err != nil {
+			return components, err
+		}
+
+		l.Debugf("Discovery: filter evaluation complete (in=%d, out=%d)", len(components), len(filtered))
+
+		components = filtered
+	}
+
+	cycleCheckErr := telemetry.TelemeterFromContext(ctx).Collect(
+		ctx, "discovery_cycle_check", map[string]any{},
+		func(childCtx context.Context) error {
+			if _, cycleErr := components.CycleCheck(); cycleErr != nil {
+				l.Debugf("Cycle: %v", cycleErr)
+
+				if d.breakCycles {
+					l.Warnf("Cycle detected in dependency graph, attempting removal of cycles.")
+
+					var removeErr error
+
+					components, removeErr = removeCycles(components)
+					if removeErr != nil {
+						return removeErr
+					}
+				}
+			}
+
+			return nil
+		})
+
+	if cycleCheckErr != nil && !d.suppressParseErrors {
+		return components, cycleCheckErr
+	}
+
+	if d.graphTarget != "" {
+		components = d.filterGraphTarget(components)
+	}
+
+	components = d.applyQueueFilters(opts, components)
+
+	return components, nil
+}
+
+// logPhaseComplete emits a debug log summarizing a discovery phase's outcome.
+func logPhaseComplete(l log.Logger, name string, results *PhaseResults, err error) {
+	var discovered, candidates int
+	if results != nil {
+		discovered = len(results.Discovered)
+		candidates = len(results.Candidates)
+	}
+
+	l.Debugf("Discovery: %s phase complete (discovered=%d, candidates=%d, err=%v)", name, discovered, candidates, err)
+}
+
+// runFilesystemPhase runs the filesystem and worktree phases concurrently.
+func (d *Discovery) runFilesystemPhase(
+	ctx context.Context,
+	l log.Logger,
+	opts *options.TerragruntOptions,
+) (*PhaseResults, error) {
+	var (
+		allDiscovered []DiscoveryResult
+		allCandidates []DiscoveryResult
+		allErrors     []error
+		mu            sync.Mutex
+	)
+
+	// maxPhases is the maximum number of phases to run concurrently
+	// for filesystem and worktree phases.
+	const maxPhases = 2
+
+	g, ctx := errgroup.WithContext(ctx)
+	g.SetLimit(maxPhases)
+
+	g.Go(func() error {
+		var result *PhaseResults
+
+		l.Debugf("Discovery: starting filesystem walk at %s", d.workingDir)
+
+		err := telemetry.TelemeterFromContext(ctx).Collect(ctx, "discovery_filesystem_walk", map[string]any{
+			"num_workers": d.numWorkers,
+			"working_dir": d.workingDir,
+		}, func(childCtx context.Context) error {
+			phase := NewFilesystemPhase(d.numWorkers)
+
+			var phaseErr error
+
+			result, phaseErr = phase.Run(childCtx, l, &PhaseInput{
+				Opts:       opts,
+				Classifier: d.classifier,
+				Discovery:  d,
+			})
+
+			return phaseErr
+		})
+
+		logPhaseComplete(l, "filesystem walk", result, err)
+
+		mu.Lock()
+
+		if result != nil {
+			allDiscovered = append(allDiscovered, result.Discovered...)
+			allCandidates = append(allCandidates, result.Candidates...)
+		}
+
+		if err != nil {
+			allErrors = append(allErrors, err)
+		}
+
+		mu.Unlock()
+
+		return nil
+	})
+
+	if len(d.gitExpressions) > 0 && d.worktrees != nil {
+		g.Go(func() error {
+			var result *PhaseResults
+
+			l.Debugf("Discovery: starting worktree walk (git_expressions=%d)", len(d.gitExpressions))
+
+			err := telemetry.TelemeterFromContext(ctx).Collect(ctx, "discovery_worktree_walk", map[string]any{
+				"num_workers":          d.numWorkers,
+				"git_expression_count": len(d.gitExpressions),
+			}, func(childCtx context.Context) error {
+				phase := NewWorktreePhase(d.gitExpressions, d.numWorkers)
+
+				var phaseErr error
+
+				result, phaseErr = phase.Run(childCtx, l, &PhaseInput{
+					Opts:       opts,
+					Classifier: d.classifier,
+					Discovery:  d,
+				})
+
+				return phaseErr
+			})
+
+			logPhaseComplete(l, "worktree walk", result, err)
+
+			mu.Lock()
+
+			if result != nil {
+				allDiscovered = append(allDiscovered, result.Discovered...)
+				allCandidates = append(allCandidates, result.Candidates...)
+			}
+
+			if err != nil {
+				allErrors = append(allErrors, err)
+			}
+
+			mu.Unlock()
+
+			return nil
+		})
+	}
+
+	if err := g.Wait(); err != nil {
+		allErrors = append(allErrors, err)
+	}
+
+	if err := validateNoCoexistence(allDiscovered); err != nil {
+		return nil, err
+	}
+
+	if err := validateNoCoexistence(allCandidates); err != nil {
+		return nil, err
+	}
+
+	allDiscovered = deduplicateResults(allDiscovered)
+	allCandidates = deduplicateResults(allCandidates)
+
+	return &PhaseResults{
+		Discovered: allDiscovered,
+		Candidates: allCandidates,
+	}, errors.Join(allErrors...)
+}
+
+// runParsePhase runs the parse phase for candidates that require parsing.
+func (d *Discovery) runParsePhase(
+	ctx context.Context,
+	l log.Logger,
+	opts *options.TerragruntOptions,
+	discovered []DiscoveryResult,
+	candidates []DiscoveryResult,
+) (*PhaseResults, error) {
+	phase := NewParsePhase(d.numWorkers)
+	result, err := phase.Run(ctx, l, &PhaseInput{
+		Opts:       opts,
+		Components: resultsToComponents(discovered),
+		Candidates: candidates,
+		Classifier: d.classifier,
+		Discovery:  d,
+	})
+
+	allDiscovered := discovered
+	if result != nil {
+		allDiscovered = append(allDiscovered, result.Discovered...)
+	}
+
+	allDiscovered = deduplicateResults(allDiscovered)
+
+	var resultCandidates []DiscoveryResult
+	if result != nil {
+		resultCandidates = result.Candidates
+	}
+
+	return &PhaseResults{
+		Discovered: allDiscovered,
+		Candidates: resultCandidates,
+	}, err
+}
+
+// runGraphPhase runs the graph traversal phase.
+func (d *Discovery) runGraphPhase(
+	ctx context.Context,
+	l log.Logger,
+	opts *options.TerragruntOptions,
+	discovered []DiscoveryResult,
+	candidates []DiscoveryResult,
+) (*PhaseResults, error) {
+	if d.classifier.HasDependentFilters() {
+		allComponents := resultsToComponents(discovered)
+		allComponents = append(allComponents, resultsToComponents(candidates)...)
+
+		var buildErrs []error
+
+		telemetry.TelemeterFromContext(ctx).Collect( //nolint:errcheck
+			ctx, "discover_dependents", map[string]any{},
+			func(childCtx context.Context) error {
+				buildErrs = d.buildDependencyGraph(childCtx, l, opts, allComponents)
+				return errors.Join(buildErrs...)
+			})
+
+		if len(buildErrs) > 0 && !d.suppressParseErrors {
+			return &PhaseResults{
+				Discovered: discovered,
+				Candidates: candidates,
+			}, errors.Join(buildErrs...)
+		}
+	}
+
+	phase := NewGraphPhase(d.numWorkers, d.maxDependencyDepth)
+
+	var (
+		result *PhaseResults
+		err    error
+	)
+
+	telemetry.TelemeterFromContext(ctx).Collect( //nolint:errcheck
+		ctx, "discover_dependencies", map[string]any{},
+		func(childCtx context.Context) error {
+			result, err = phase.Run(childCtx, l, &PhaseInput{
+				Opts:       opts,
+				Components: resultsToComponents(discovered),
+				Candidates: candidates,
+				Classifier: d.classifier,
+				Discovery:  d,
+			})
+
+			return err
+		})
+
+	allDiscovered := discovered
+	if result != nil {
+		allDiscovered = append(allDiscovered, result.Discovered...)
+	}
+
+	allDiscovered = deduplicateResults(allDiscovered)
+
+	var resultCandidates []DiscoveryResult
+	if result != nil {
+		resultCandidates = result.Candidates
+	}
+
+	return &PhaseResults{
+		Discovered: allDiscovered,
+		Candidates: resultCandidates,
+	}, err
+}
+
+// runRelationshipPhase runs the relationship discovery phase.
+func (d *Discovery) runRelationshipPhase(
+	ctx context.Context,
+	l log.Logger,
+	opts *options.TerragruntOptions,
+	components component.Components,
+) (component.Components, error) {
+	phase := NewRelationshipPhase(d.numWorkers, d.maxDependencyDepth)
+	_, err := phase.Run(ctx, l, &PhaseInput{
+		Opts:       opts,
+		Components: components,
+		Discovery:  d,
+	})
+
+	return components, err
+}
+
+// buildDependencyGraph parses all components and builds bidirectional dependency links.
+// This is called before the graph phase when dependent filters exist, to populate
+// the reverse links (dependents) that the graph phase needs for dependent traversal.
+func (d *Discovery) buildDependencyGraph(
+	ctx context.Context,
+	l log.Logger,
+	opts *options.TerragruntOptions,
+	allComponents component.Components,
+) []error {
+	threadSafeComponents := component.NewThreadSafeComponents(allComponents)
+
+	var (
+		errs []error
+		mu   sync.Mutex
+	)
+
+	g, ctx := errgroup.WithContext(ctx)
+	g.SetLimit(d.numWorkers)
+
+	for _, c := range allComponents {
+		g.Go(func() error {
+			err := d.buildComponentDependencies(ctx, l, opts, c, threadSafeComponents)
+			if err != nil {
+				mu.Lock()
+
+				errs = append(errs, err)
+
+				mu.Unlock()
+			}
+
+			return nil
+		})
+	}
+
+	err := g.Wait()
+	if err != nil {
+		l.Debugf("Error building dependency graph: %v", err)
+	}
+
+	return errs
+}
+
+// buildComponentDependencies parses a single component and builds its dependency links.
+func (d *Discovery) buildComponentDependencies(
+	ctx context.Context,
+	l log.Logger,
+	opts *options.TerragruntOptions,
+	c component.Component,
+	threadSafeComponents *component.ThreadSafeComponents,
+) error {
+	unit, ok := c.(*component.Unit)
+	if !ok {
+		return nil
+	}
+
+	ctx = contextWithParsePhase(ctx, parsePhaseTagDependencyGraph)
+
+	if err := ensureParsed(ctx, l, c, opts, d); err != nil {
+		if d.suppressParseErrors {
+			l.Debugf("Suppressed parse error for %s: %v", c.Path(), err)
+			return nil
+		}
+
+		return err
+	}
+
+	cfg := unit.Config()
+
+	depPaths, err := extractDependencyPaths(cfg, c)
+	if err != nil {
+		return err
+	}
+
+	depPaths, err = stackDependencyPaths(ctx, l, vfs.NewOSFS(), opts, depPaths)
+	if err != nil {
+		return err
+	}
+
+	if len(depPaths) == 0 {
+		return nil
+	}
+
+	parentCtx := c.DiscoveryContext()
+	if parentCtx == nil {
+		return nil
+	}
+
+	for _, depPath := range depPaths {
+		depComponent := componentFromDependencyPath(depPath, threadSafeComponents)
+
+		if isExternal(parentCtx.WorkingDir, depPath) {
+			if ext, ok := depComponent.(*component.Unit); ok {
+				ext.SetExternal()
+			}
+		}
+
+		addedComponent, created := threadSafeComponents.EnsureComponent(depComponent)
+		if created {
+			copiedCtx := parentCtx.CopyWithNewOrigin(component.OriginGraphDiscovery)
+			depComponent.SetDiscoveryContext(copiedCtx)
+		}
+
+		c.AddDependency(addedComponent)
+	}
+
+	return nil
+}
+
+// removeCycles removes cycles from the dependency graph.
+func removeCycles(components component.Components) (component.Components, error) {
+	var (
+		c   component.Component
+		err error
+	)
+
+	for range maxCycleRemovalAttempts {
+		c, err = components.CycleCheck()
+		if err == nil {
+			break
+		}
+
+		if c == nil {
+			break
+		}
+
+		components = components.RemoveByPath(c.Path())
+	}
+
+	return components, err
+}
+
+// filterGraphTarget prunes components to the target path and its dependents.
+func (d *Discovery) filterGraphTarget(components component.Components) component.Components {
+	if d.graphTarget == "" {
+		return components
+	}
+
+	targetPath := canonicalizeGraphTarget(d.workingDir, d.graphTarget)
+
+	dependentUnits := buildDependentsIndex(components)
+	propagateTransitiveDependents(dependentUnits)
+
+	allowed := buildAllowSet(targetPath, dependentUnits)
+
+	return filterByAllowSet(components, allowed)
+}
+
+// canonicalizeGraphTarget resolves the graph target to an absolute, cleaned path with symlinks resolved.
+// Returns an error if the path cannot be made absolute.
+func canonicalizeGraphTarget(baseDir, target string) string {
+	var abs string
+
+	// If already absolute, just clean it
+	if filepath.IsAbs(target) {
+		abs = filepath.Clean(target)
+	} else if canonicalAbs, err := util.CanonicalPath(target, baseDir); err == nil {
+		// Try canonical path first
+		abs = canonicalAbs
+	} else {
+		// Fallback: join with baseDir and clean
+		abs = filepath.Clean(filepath.Join(baseDir, target))
+	}
+
+	// Resolve symlinks for consistent path comparison (important on macOS where /var -> /private/var)
+	// EvalSymlinks can fail for: non-existent paths (expected during discovery),
+	// broken symlinks, or permission issues. In all cases, falling back to the
+	// absolute path is acceptable - the path will be validated later when used.
+	resolved, evalErr := filepath.EvalSymlinks(abs)
+	if evalErr != nil {
+		return abs
+	}
+
+	return resolved
+}
+
+// buildDependentsIndex builds an index mapping each unit path to the list of units
+// that directly depend on it. Duplicate entries are removed.
+// Paths are resolved to handle symlinks consistently across platforms.
+func buildDependentsIndex(components component.Components) map[string][]string {
+	dependentUnits := make(map[string][]string)
+
+	for _, c := range components {
+		cPath := util.ResolvePath(c.Path())
+
+		for _, dep := range c.Dependencies() {
+			depPath := util.ResolvePath(dep.Path())
+			dependentUnits[depPath] = util.RemoveDuplicates(append(dependentUnits[depPath], cPath))
+		}
+	}
+
+	return dependentUnits
+}
+
+// propagateTransitiveDependents expands the dependents index to include transitive dependents.
+// Iteratively propagates dependents until a fixed point is reached or the iteration cap is met.
+func propagateTransitiveDependents(dependentUnits map[string][]string) {
+	// Determine an upper bound on iterations based on unique nodes in the graph (keys + values).
+	nodes := make(map[string]struct{})
+	for unit, dependents := range dependentUnits {
+		nodes[unit] = struct{}{}
+		for _, dep := range dependents {
+			nodes[dep] = struct{}{}
+		}
+	}
+
+	maxIterations := len(nodes)
+
+	for range maxIterations {
+		updated := false
+
+		for unit, dependents := range dependentUnits {
+			for _, dep := range dependents {
+				old := dependentUnits[unit]
+				newList := util.RemoveDuplicates(append(old, dependentUnits[dep]...))
+				newList = slices.DeleteFunc(newList, func(path string) bool { return path == unit })
+
+				if len(newList) != len(old) {
+					dependentUnits[unit] = newList
+					updated = true
+				}
+			}
+		}
+
+		if !updated {
+			break
+		}
+	}
+}
+
+// buildAllowSet creates the allowlist containing the target and all of its dependents.
+func buildAllowSet(targetPath string, dependentUnits map[string][]string) map[string]struct{} {
+	allowed := make(map[string]struct{})
+
+	allowed[targetPath] = struct{}{}
+	for _, dep := range dependentUnits[targetPath] {
+		allowed[dep] = struct{}{}
+	}
+
+	return allowed
+}
+
+// filterByAllowSet returns only the components whose path exists in the allow set.
+// Paths are resolved to handle symlinks consistently across platforms.
+// The output order matches the input order (no sorting is performed here).
+func filterByAllowSet(components component.Components, allowed map[string]struct{}) component.Components {
+	filtered := make(component.Components, 0, len(components))
+
+	for _, c := range components {
+		resolvedPath := util.ResolvePath(c.Path())
+		if _, ok := allowed[resolvedPath]; ok {
+			filtered = append(filtered, c)
+		}
+	}
+
+	return filtered
+}
+
+// applyQueueFilters marks discovered units as excluded or included based on queue-related CLI flags and config.
+// The runner consumes the exclusion markers instead of re-evaluating the filters.
+func (d *Discovery) applyQueueFilters(
+	opts *options.TerragruntOptions,
+	components component.Components,
+) component.Components {
+	components = d.applyExcludeModules(opts, components)
+
+	return components
+}
+
+// applyExcludeModules marks units (and optionally their dependencies) excluded via terragrunt exclude blocks.
+func (d *Discovery) applyExcludeModules(
+	opts *options.TerragruntOptions,
+	components component.Components,
+) component.Components {
+	for _, c := range components {
+		unit, ok := c.(*component.Unit)
+		if !ok {
+			continue
+		}
+
+		cfg := unit.Config()
+		if cfg == nil || cfg.Exclude == nil {
+			continue
+		}
+
+		if !cfg.Exclude.IsActionListed(opts.TerraformCommand) {
+			continue
+		}
+
+		if cfg.Exclude.If {
+			unit.SetExcluded(true)
+
+			if cfg.Exclude.ExcludeDependencies != nil && *cfg.Exclude.ExcludeDependencies {
+				for _, dep := range unit.Dependencies() {
+					depUnit, ok := dep.(*component.Unit)
+					if !ok {
+						continue
+					}
+
+					depUnit.SetExcluded(true)
+				}
+			}
+		}
+	}
+
+	return components
+}

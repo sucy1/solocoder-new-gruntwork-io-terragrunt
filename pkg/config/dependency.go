@@ -1,0 +1,1743 @@
+package config
+
+import (
+	"bufio"
+	"bytes"
+	"context"
+	"encoding/json"
+	"fmt"
+	"io"
+	"os"
+	"path/filepath"
+	"slices"
+	"strings"
+	"sync"
+
+	"github.com/aws/aws-sdk-go-v2/aws"
+	"github.com/aws/aws-sdk-go-v2/service/s3"
+	"github.com/gruntwork-io/terragrunt/internal/awshelper"
+	"github.com/gruntwork-io/terragrunt/internal/cache"
+	"github.com/gruntwork-io/terragrunt/internal/experiment"
+	"github.com/gruntwork-io/terragrunt/internal/iacargs"
+	"github.com/gruntwork-io/terragrunt/internal/remotestate"
+	"github.com/gruntwork-io/terragrunt/pkg/log"
+
+	s3backend "github.com/gruntwork-io/terragrunt/internal/remotestate/backend/s3"
+
+	"github.com/gruntwork-io/terragrunt/internal/getter"
+	"github.com/zclconf/go-cty/cty"
+	"github.com/zclconf/go-cty/cty/gocty"
+	ctyjson "github.com/zclconf/go-cty/cty/json"
+	"golang.org/x/sync/errgroup"
+
+	"github.com/gruntwork-io/terragrunt/internal/codegen"
+	"github.com/gruntwork-io/terragrunt/internal/iam"
+	"github.com/gruntwork-io/terragrunt/internal/report"
+	"github.com/gruntwork-io/terragrunt/internal/runner/run"
+	"github.com/gruntwork-io/terragrunt/internal/runner/run/creds"
+	"github.com/gruntwork-io/terragrunt/internal/runner/run/creds/providers/amazonsts"
+	"github.com/gruntwork-io/terragrunt/internal/runner/run/creds/providers/externalcmd"
+	"github.com/gruntwork-io/terragrunt/internal/shell"
+	"github.com/gruntwork-io/terragrunt/internal/telemetry"
+	"github.com/gruntwork-io/terragrunt/internal/tf"
+	"github.com/gruntwork-io/terragrunt/internal/util"
+	"github.com/gruntwork-io/terragrunt/pkg/config/hclparse"
+
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/trace"
+)
+
+const (
+	renderJSONCommand = "render-json"
+	renderCommand     = "render"
+)
+
+type Dependencies []Dependency
+
+// Struct to hold the decoded dependency blocks.
+type dependencyOutputCache struct {
+	Enabled *bool
+	Inputs  cty.Value
+}
+
+type Dependency struct {
+	ConfigPath                          cty.Value  `hcl:"config_path,attr" cty:"config_path"`
+	Enabled                             *bool      `hcl:"enabled,attr" cty:"enabled"`
+	SkipOutputs                         *bool      `hcl:"skip_outputs,attr" cty:"skip"`
+	MockOutputs                         *cty.Value `hcl:"mock_outputs,attr" cty:"mock_outputs"`
+	MockOutputsAllowedTerraformCommands *[]string  `hcl:"mock_outputs_allowed_terraform_commands,attr" cty:"mock_outputs_allowed_terraform_commands"`
+
+	// MockOutputsMergeWithState is deprecated. Use MockOutputsMergeStrategyWithState
+	MockOutputsMergeWithState *bool `hcl:"mock_outputs_merge_with_state,attr" cty:"mock_outputs_merge_with_state"`
+
+	MockOutputsMergeStrategyWithState *MergeStrategyType `hcl:"mock_outputs_merge_strategy_with_state" cty:"mock_outputs_merge_strategy_with_state"`
+
+	// Used to store the rendered outputs for use when the config is imported or read with `read_terragrunt_config`
+	RenderedOutputs *cty.Value `cty:"outputs"`
+
+	Inputs *cty.Value `cty:"inputs"`
+	Name   string     `hcl:",label" cty:"name"`
+}
+
+// DeepMerge will deep merge two Dependency configs, updating the target. Deep merge for Dependency configs is defined
+// as follows:
+//   - For simple attributes (bools and strings), the source will override the target.
+//   - For MockOutputs, the two maps will be deeply merged together. This means that maps are recursively merged, while
+//     lists are concatenated together.
+//   - For MockOutputsAllowedTerraformCommands, the source will be concatenated to the target.
+//
+// Note that RenderedOutputs is ignored in the deep merge operation.
+func (dep *Dependency) DeepMerge(sourceDepConfig *Dependency) error {
+	if sourceDepConfig.ConfigPath.AsString() != "" {
+		dep.ConfigPath = sourceDepConfig.ConfigPath
+	}
+
+	if sourceDepConfig.Enabled != nil {
+		dep.Enabled = sourceDepConfig.Enabled
+	}
+
+	if sourceDepConfig.SkipOutputs != nil {
+		dep.SkipOutputs = sourceDepConfig.SkipOutputs
+	}
+
+	if err := dep.mergeMockOutputs(sourceDepConfig); err != nil {
+		return err
+	}
+
+	dep.mergeMockOutputsAllowedTerraformCommands(sourceDepConfig)
+
+	return nil
+}
+
+// mergeMockOutputs deep-merges sourceDepConfig.MockOutputs into dep.MockOutputs, adopting the source pointer when dep is unset and skipping when both sides point at the same value.
+func (dep *Dependency) mergeMockOutputs(sourceDepConfig *Dependency) error {
+	if sourceDepConfig.MockOutputs == nil {
+		return nil
+	}
+
+	if dep.MockOutputs == nil {
+		dep.MockOutputs = sourceDepConfig.MockOutputs
+		return nil
+	}
+
+	if dep.MockOutputs == sourceDepConfig.MockOutputs {
+		return nil
+	}
+
+	merged, err := deepMergeCtyMaps(*dep.MockOutputs, *sourceDepConfig.MockOutputs)
+	if err != nil {
+		return err
+	}
+
+	dep.MockOutputs = merged
+
+	return nil
+}
+
+// mergeMockOutputsAllowedTerraformCommands concatenates source commands onto dep's, adopting the source pointer when dep is unset and skipping when both sides point at the same slice.
+func (dep *Dependency) mergeMockOutputsAllowedTerraformCommands(sourceDepConfig *Dependency) {
+	if sourceDepConfig.MockOutputsAllowedTerraformCommands == nil {
+		return
+	}
+
+	if dep.MockOutputsAllowedTerraformCommands == nil {
+		dep.MockOutputsAllowedTerraformCommands = sourceDepConfig.MockOutputsAllowedTerraformCommands
+		return
+	}
+
+	if dep.MockOutputsAllowedTerraformCommands == sourceDepConfig.MockOutputsAllowedTerraformCommands {
+		return
+	}
+
+	merged := append(*dep.MockOutputsAllowedTerraformCommands, *sourceDepConfig.MockOutputsAllowedTerraformCommands...)
+	dep.MockOutputsAllowedTerraformCommands = &merged
+}
+
+// getMockOutputsMergeStrategy returns the merge strategy for mock outputs, prioritizing mock_outputs_merge_strategy_with_state over the deprecated mock_outputs_merge_with_state boolean and defaulting to NoMerge.
+func (dep *Dependency) getMockOutputsMergeStrategy() MergeStrategyType {
+	if dep.MockOutputsMergeStrategyWithState != nil {
+		return *dep.MockOutputsMergeStrategyWithState
+	}
+
+	if dep.MockOutputsMergeWithState != nil && (*dep.MockOutputsMergeWithState) {
+		return ShallowMerge
+	}
+
+	return NoMerge
+}
+
+// Given a dependency config, we should only attempt to get the outputs if SkipOutputs is nil or false
+func (dep *Dependency) shouldGetOutputs(ctx *ParsingContext) bool {
+	return !ctx.SkipOutput && dep.isEnabled() && (dep.SkipOutputs == nil || !*dep.SkipOutputs)
+}
+
+// isEnabled returns true if the dependency is enabled
+func (dep *Dependency) isEnabled() bool {
+	if dep.Enabled == nil {
+		return true
+	}
+
+	return *dep.Enabled
+}
+
+// isDisabled returns true if the dependency is disabled
+func (dep *Dependency) isDisabled() bool {
+	return !dep.isEnabled()
+}
+
+// Given a dependency config, we should only attempt to merge mocks outputs with the outputs if MockOutputsMergeWithState is not nil or true
+func (dep *Dependency) shouldMergeMockOutputsWithState(ctx *ParsingContext) bool {
+	allowedCommand :=
+		dep.MockOutputsAllowedTerraformCommands == nil ||
+			len(*dep.MockOutputsAllowedTerraformCommands) == 0 ||
+			slices.Contains(*dep.MockOutputsAllowedTerraformCommands, ctx.OriginalTerraformCommand)
+
+	return allowedCommand && dep.getMockOutputsMergeStrategy() != NoMerge
+}
+
+func (dep *Dependency) setRenderedOutputs(ctx context.Context, pctx *ParsingContext, l log.Logger) error {
+	if dep == nil {
+		return nil
+	}
+
+	if dep.shouldGetOutputs(pctx) || dep.shouldReturnMockOutputs(pctx) {
+		outputVal, err := getTerragruntOutputIfAppliedElseConfiguredDefault(ctx, pctx, l, dep)
+		if err != nil {
+			return err
+		}
+
+		dep.RenderedOutputs = outputVal
+	}
+
+	return nil
+}
+
+// outputLocksFromContext retrieves the KeyLocks from the context for synchronizing output retrieval.
+// If not present in context, returns a new KeyLocks instance.
+func outputLocksFromContext(ctx context.Context) *util.KeyLocks {
+	if val, ok := ctx.Value(OutputLocksContextKey).(*util.KeyLocks); ok && val != nil {
+		return val
+	}
+
+	return util.NewKeyLocks()
+}
+
+// Decode the dependency blocks from the file, and then retrieve all the outputs from the remote state. Then encode the
+// resulting map as a cty.Value object.
+// TODO: In the future, consider allowing importing dependency blocks from included config
+// NOTE FOR MAINTAINER: When implementing importation of other config blocks (e.g referencing inputs), carefully
+//
+//	consider whether or not the implementation of the cyclic dependency detection still makes sense.
+func decodeAndRetrieveOutputs(ctx context.Context, pctx *ParsingContext, l log.Logger, file *hclparse.File) (*cty.Value, error) {
+	evalParsingContext, err := createTerragruntEvalContext(ctx, pctx, l, file.ConfigPath)
+	if err != nil {
+		return nil, err
+	}
+
+	decodedDependency := TerragruntDependency{}
+	if err := file.Decode(&decodedDependency, evalParsingContext); err != nil {
+		return nil, err
+	}
+
+	// In normal operation, if a dependency block does not have a `config_path` attribute, decoding returns an error since this attribute is required, but the `hclvalidate` command suppresses decoding errors and this causes a cycle between modules, so we need to filter out dependencies without a defined `config_path`.
+	decodedDependency.Dependencies = decodedDependency.Dependencies.FilteredWithoutConfigPath()
+
+	// Fold sibling autoinclude dependency blocks in before output retrieval so the unit body can reference them, like a regular include.
+	decodedDependency.Dependencies, err = foldSiblingAutoIncludeDeps(ctx, pctx, l, decodedDependency.Dependencies)
+	if err != nil {
+		return nil, err
+	}
+
+	// Validate that dependency config_path is not an empty string.
+	// Skip null/unknown values and non-strings (which can appear during partial decode or hclvalidate).
+	for _, dep := range decodedDependency.Dependencies {
+		if dep.isDisabled() {
+			continue
+		}
+
+		if !IsValidConfigPath(dep.ConfigPath) {
+			// During hcl validate, config_path may be unresolvable (e.g., references an
+			// unavailable local). Skip the invalid dependency instead of aborting — it will
+			// get a cty.DynamicVal placeholder in dependencyBlocksToCtyValue.
+			if pctx.SkipOutput {
+				continue
+			}
+
+			return nil, DependencyInvalidConfigPathError{DependencyName: dep.Name}
+		}
+	}
+
+	if err := checkForDependencyBlockCycles(ctx, pctx, l, pctx.TerragruntConfigPath, decodedDependency); err != nil {
+		return nil, err
+	}
+
+	updatedDependencies, err := decodeDependencies(ctx, pctx, l, decodedDependency)
+	if err != nil {
+		return nil, err
+	}
+
+	decodedDependency = *updatedDependencies
+
+	// Merge in included dependencies
+	if pctx.TrackInclude != nil {
+		mergedDecodedDependency, err := handleIncludeForDependency(ctx, pctx, l, decodedDependency)
+		if err != nil {
+			return nil, err
+		}
+
+		decodedDependency = *mergedDecodedDependency
+	}
+
+	// Extract dependency names for tracing
+	dependencyNames := make([]string, 0, len(decodedDependency.Dependencies))
+	for _, dep := range decodedDependency.Dependencies {
+		dependencyNames = append(dependencyNames, dep.Name)
+	}
+
+	var result *cty.Value
+
+	err = TraceParseDependencies(ctx, file.ConfigPath, pctx.SkipOutputsResolution, len(decodedDependency.Dependencies), dependencyNames, func(ctx context.Context) error {
+		var depErr error
+
+		result, depErr = dependencyBlocksToCtyValue(ctx, pctx, l, decodedDependency.Dependencies)
+
+		return depErr
+	})
+
+	return result, err
+}
+
+// decodeDependencies decode dependencies and fetch inputs
+func decodeDependencies(ctx context.Context, pctx *ParsingContext, l log.Logger, decodedDependency TerragruntDependency) (*TerragruntDependency, error) {
+	updatedDependencies := TerragruntDependency{}
+	depCache := cache.ContextCache[*dependencyOutputCache](ctx, DependencyOutputCacheContextKey)
+
+	for _, dep := range decodedDependency.Dependencies {
+		if !dep.isEnabled() {
+			updatedDependencies.Dependencies = append(updatedDependencies.Dependencies, dep)
+			continue
+		}
+
+		if !IsValidConfigPath(dep.ConfigPath) {
+			if pctx.SkipOutput {
+				updatedDependencies.Dependencies = append(updatedDependencies.Dependencies, dep)
+				continue
+			}
+
+			return &updatedDependencies, DependencyInvalidConfigPathError{DependencyName: dep.Name}
+		}
+
+		depPath := getCleanedTargetConfigPath(dep.ConfigPath.AsString(), pctx.TerragruntConfigPath)
+
+		if !util.FileExists(depPath) {
+			updatedDependencies.Dependencies = append(updatedDependencies.Dependencies, dep)
+
+			continue
+		}
+
+		cacheKey := filepath.Join(pctx.WorkingDir, depPath)
+
+		// Cache hit - reuse cached values
+		if cachedDependency, found := depCache.Get(ctx, cacheKey); found {
+			dep.Enabled = cachedDependency.Enabled
+			dep.Inputs = &cachedDependency.Inputs
+			updatedDependencies.Dependencies = append(updatedDependencies.Dependencies, dep)
+
+			continue
+		}
+
+		// Cache miss - parse and cache
+
+		if !pctx.SkipOutputsResolution {
+			l.Debugf("Reading Terragrunt config file at %s", util.RelPathForLog(pctx.RootWorkingDir, depPath, pctx.Writers.LogShowAbsPaths))
+		}
+
+		_, depCtx, err := pctx.WithDependencyConfigPath(l, depPath)
+		if err != nil {
+			return nil, err
+		}
+
+		if depCtx.IAMRoleOptions != depCtx.OriginalIAMRoleOptions {
+			depCtx.IAMRoleOptions = iam.RoleOptions{}
+		}
+
+		depCtx = depCtx.WithDecodeList(TerragruntFlags).WithDiagnosticsSuppressed(l)
+
+		depConfig, err := PartialParseConfigFile(ctx, depCtx, l, depPath, nil)
+		if err != nil {
+			l.Warnf("Error reading partial config for dependency %s at %s: %v", dep.Name, depPath, err)
+			updatedDependencies.Dependencies = append(updatedDependencies.Dependencies, dep)
+
+			continue
+		}
+
+		inputsCty, err := convertToCtyWithJSON(depConfig.Inputs)
+		if err != nil {
+			return nil, fmt.Errorf("failed to convert inputs for dependency %q: %w", dep.Name, err)
+		}
+
+		cachedValue := dependencyOutputCache{
+			Enabled: dep.Enabled,
+			Inputs:  inputsCty,
+		}
+		depCache.Put(ctx, cacheKey, &cachedValue)
+
+		dep.Inputs = &inputsCty
+
+		updatedDependencies.Dependencies = append(updatedDependencies.Dependencies, dep)
+	}
+
+	return &updatedDependencies, nil
+}
+
+// Convert the list of parsed Dependency blocks into a list of module dependencies. Each output block should
+// become a dependency of the current config, since that module has to be applied before we can read the output.
+func dependencyBlocksToModuleDependencies(l log.Logger, decodedDependencyBlocks []Dependency) *ModuleDependencies {
+	if len(decodedDependencyBlocks) == 0 {
+		return nil
+	}
+
+	paths := []string{}
+
+	for _, decodedDependencyBlock := range decodedDependencyBlocks {
+		// skip dependency if is not enabled
+		if !decodedDependencyBlock.isEnabled() {
+			continue
+		}
+
+		// Skip if ConfigPath is not a known string value (can happen during discovery phase)
+		if decodedDependencyBlock.ConfigPath.IsNull() ||
+			!decodedDependencyBlock.ConfigPath.IsWhollyKnown() ||
+			!decodedDependencyBlock.ConfigPath.Type().Equals(cty.String) {
+			l.Debugf("Skipping dependency %q: ConfigPath is not a valid known string value", decodedDependencyBlock.Name)
+			continue
+		}
+
+		paths = append(paths, decodedDependencyBlock.ConfigPath.AsString())
+	}
+
+	return &ModuleDependencies{Paths: paths}
+}
+
+// Check for cyclic dependency blocks to avoid infinite `terragrunt output` loops. To avoid reparsing the config, we
+// kickstart the initial loop using what we already decoded.
+func checkForDependencyBlockCycles(ctx context.Context, pctx *ParsingContext, l log.Logger, configPath string, decodedDependency TerragruntDependency) error {
+	visitedPaths := []string{}
+	currentTraversalPaths := []string{configPath}
+
+	for _, dependency := range decodedDependency.Dependencies {
+		if dependency.isDisabled() {
+			continue
+		}
+
+		if !IsValidConfigPath(dependency.ConfigPath) {
+			if pctx.SkipOutput {
+				continue
+			}
+
+			return DependencyInvalidConfigPathError{DependencyName: dependency.Name}
+		}
+
+		dependencyPath := getCleanedTargetConfigPath(dependency.ConfigPath.AsString(), configPath)
+
+		// Skip cycle checking for nonexistent dependency targets — there is nothing to traverse.
+		if !util.FileExists(dependencyPath) {
+			continue
+		}
+
+		l, dependencyContext, err := pctx.WithDependencyConfigPath(l, dependencyPath)
+		if err != nil {
+			return err
+		}
+
+		if err := checkForDependencyBlockCyclesUsingDFS(ctx, dependencyContext, l, dependencyPath, &visitedPaths, &currentTraversalPaths); err != nil {
+			return err
+		}
+	}
+
+	return nil
+}
+
+// Helper function for checkForDependencyBlockCycles.
+//
+// Same implementation as configstack/graph.go:checkForCyclesUsingDepthFirstSearch, except walks the graph of
+// dependencies by `dependency` blocks (which make explicit `terragrunt output` calls) instead of explicit dependencies.
+func checkForDependencyBlockCyclesUsingDFS(
+	ctx context.Context,
+	pctx *ParsingContext,
+	l log.Logger,
+	dependencyPath string,
+	visitedPaths *[]string,
+	currentTraversalPaths *[]string,
+) error {
+	if slices.Contains(*visitedPaths, dependencyPath) {
+		return nil
+	}
+
+	if slices.Contains(*currentTraversalPaths, dependencyPath) {
+		return DependencyCycleError(append(*currentTraversalPaths, dependencyPath))
+	}
+
+	*currentTraversalPaths = append(*currentTraversalPaths, dependencyPath)
+
+	dependencyPaths, err := getDependencyBlockConfigPathsByFilepath(ctx, pctx, l, dependencyPath)
+	if err != nil {
+		return err
+	}
+
+	for _, dependency := range dependencyPaths {
+		dependencyPath := getCleanedTargetConfigPath(dependency, dependencyPath)
+
+		l, dependencyContext, err := pctx.WithDependencyConfigPath(l, dependencyPath)
+		if err != nil {
+			return err
+		}
+
+		if err := checkForDependencyBlockCyclesUsingDFS(ctx, dependencyContext, l, dependencyPath, visitedPaths, currentTraversalPaths); err != nil {
+			return err
+		}
+	}
+
+	*visitedPaths = append(*visitedPaths, dependencyPath)
+	*currentTraversalPaths = slices.DeleteFunc(*currentTraversalPaths, func(path string) bool { return path == dependencyPath })
+
+	return nil
+}
+
+// Given the config path, return the list of config paths that are specified as dependency blocks in the config
+func getDependencyBlockConfigPathsByFilepath(ctx context.Context, pctx *ParsingContext, l log.Logger, configPath string) ([]string, error) {
+	// This will automatically parse everything needed to parse the dependency block configs, and load them as
+	// TerragruntConfig.Dependencies. Note that since we aren't passing in `DependenciesBlock` to the
+	// PartialDecodeSectionType list, the Dependencies attribute will not include any dependencies specified via the
+	// dependencies block.
+	tgConfig, err := PartialParseConfigFile(ctx, pctx.WithDecodeList(DependencyBlock).WithDiagnosticsSuppressed(l), l, configPath, nil)
+	if err != nil {
+		return nil, err
+	}
+
+	if tgConfig.Dependencies == nil {
+		return []string{}, nil
+	}
+
+	return tgConfig.Dependencies.Paths, nil
+}
+
+// Encode the list of dependency blocks into a single cty.Value object that maps the dependency block name to the
+// encoded dependency mapping. The encoded dependency mapping should have the attributes:
+//   - outputs: The map of outputs of the corresponding terraform module that lives at the target config of the
+//     dependency.
+//
+// This routine will go through the process of obtaining the outputs using `terragrunt output` from the target config.
+// The traceCtx parameter is the trace context from the parent span (parse_dependencies) to establish parent-child
+// relationship for individual dependency traces.
+func dependencyBlocksToCtyValue(traceCtx context.Context, pctx *ParsingContext, l log.Logger, dependencyConfigs []Dependency) (*cty.Value, error) {
+	paths := []string{}
+
+	// dependencyMap is the top level map that maps dependency block names to the encoded version, which includes
+	// various attributes for accessing information about the target config (including the module outputs).
+	dependencyMap := map[string]cty.Value{}
+	lock := sync.Mutex{}
+	dependencyErrGroup, _ := errgroup.WithContext(traceCtx)
+
+	for _, dependencyConfig := range dependencyConfigs {
+		dependencyErrGroup.Go(func() error {
+			// Tag the context with the dependency block name so dependency_output_fetch can attach it.
+			ctx := contextWithDependencyName(traceCtx, dependencyConfig.Name)
+
+			// Loose struct to hold the attributes of the dependency. This includes:
+			// - outputs: The module outputs of the target config
+			dependencyEncodingMap := map[string]cty.Value{}
+
+			// Encode the outputs and nest under `outputs` attribute if we should get the outputs or the `mock_outputs`
+			if err := dependencyConfig.setRenderedOutputs(ctx, pctx, l); err != nil {
+				return fmt.Errorf("resolving dependency %q outputs: %w", dependencyConfig.Name, err)
+			}
+
+			if dependencyConfig.RenderedOutputs != nil {
+				lock.Lock()
+
+				paths = append(paths, dependencyConfig.ConfigPath.AsString())
+
+				lock.Unlock()
+
+				dependencyEncodingMap["outputs"] = *dependencyConfig.RenderedOutputs
+			} else if pctx.SkipOutput {
+				// During hcl validate, output resolution is skipped. Use cty.DynamicVal so that
+				// attribute access on dependency outputs (e.g. dependency.x.outputs.y) evaluates
+				// to unknown rather than producing an "Unsupported attribute" error.
+				l.Debugf("Setting outputs for dependency %s to DynamicVal (output resolution skipped)", dependencyConfig.Name)
+
+				dependencyEncodingMap["outputs"] = cty.DynamicVal
+			}
+
+			if dependencyConfig.Inputs != nil {
+				dependencyEncodingMap["inputs"] = *dependencyConfig.Inputs
+			} else if pctx.SkipOutput {
+				l.Debugf("Setting inputs for dependency %s to DynamicVal (output resolution skipped)", dependencyConfig.Name)
+
+				dependencyEncodingMap["inputs"] = cty.DynamicVal
+			}
+
+			// Once the dependency is encoded into a map, we need to convert to a cty.Value again so that it can be fed to
+			// the higher order dependency map.
+			dependencyEncodingMapEncoded, err := gocty.ToCtyValue(dependencyEncodingMap, generateTypeFromValuesMap(dependencyEncodingMap))
+			if err != nil {
+				lock.Lock()
+				err = TerragruntOutputListEncodingError{Paths: slices.Clone(paths), Err: err}
+				lock.Unlock()
+
+				return err
+			}
+
+			// Lock the map as only one goroutine should be writing to the map at a time
+			lock.Lock()
+			defer lock.Unlock()
+
+			// Finally, feed the encoded dependency into the higher order map under the block name
+			dependencyMap[dependencyConfig.Name] = dependencyEncodingMapEncoded
+
+			return nil
+		})
+	}
+
+	if err := dependencyErrGroup.Wait(); err != nil {
+		return nil, err
+	}
+
+	// We need to convert the value map to a single cty.Value at the end so that it can be used in the execution ctx
+	convertedOutput, err := gocty.ToCtyValue(dependencyMap, generateTypeFromValuesMap(dependencyMap))
+	if err != nil {
+		err = TerragruntOutputListEncodingError{Paths: paths, Err: err}
+	}
+
+	return &convertedOutput, err
+}
+
+// This will attempt to get the outputs from the target terragrunt config if it is applied. If it is not applied, the
+// behavior is different depending on the configuration of the dependency:
+//   - If the dependency block indicates a mock_outputs attribute, this will return that.
+//     If the dependency block indicates a mock_outputs_merge_strategy_with_state attribute, mock_outputs and state outputs will be merged following the merge strategy
+//   - If the dependency block does NOT indicate a mock_outputs attribute, this will return an error.
+func getTerragruntOutputIfAppliedElseConfiguredDefault(
+	ctx context.Context,
+	pctx *ParsingContext,
+	l log.Logger,
+	dependencyConfig *Dependency,
+) (*cty.Value, error) {
+	if dependencyConfig.isDisabled() {
+		l.Debugf("Skipping outputs reading for disabled dependency %s", dependencyConfig.Name)
+		return dependencyConfig.MockOutputs, nil
+	}
+
+	if dependencyConfig.shouldGetOutputs(pctx) {
+		outputVal, isEmpty, err := getTerragruntOutput(ctx, pctx, l, dependencyConfig)
+		if err != nil {
+			return nil, err
+		}
+
+		if !isEmpty && dependencyConfig.shouldMergeMockOutputsWithState(pctx) && dependencyConfig.MockOutputs != nil {
+			mockMergeStrategy := dependencyConfig.getMockOutputsMergeStrategy()
+
+			switch mockMergeStrategy { // nolint:exhaustive
+			case NoMerge:
+				return outputVal, nil
+			case ShallowMerge:
+				return shallowMergeCtyMaps(*outputVal, *dependencyConfig.MockOutputs)
+			case DeepMergeMapOnly:
+				return deepMergeCtyMapsMapOnly(*dependencyConfig.MockOutputs, *outputVal)
+			default:
+				return nil, InvalidMergeStrategyTypeError(mockMergeStrategy)
+			}
+		} else if !isEmpty {
+			return outputVal, err
+		}
+	}
+
+	// When we get no output, it can be an indication that either the module has no outputs or the module is not
+	// applied. In either case, check if there are default output values to return. If yes, return that. Else,
+	// return error.
+	targetConfig := getCleanedTargetConfigPath(dependencyConfig.ConfigPath.AsString(), pctx.TerragruntConfigPath)
+
+	if dependencyConfig.shouldReturnMockOutputs(pctx) {
+		l.Warnf("Config %s is a dependency of %s that has no outputs, but mock outputs provided and returning those in dependency output.",
+			targetConfig,
+			pctx.TerragruntConfigPath,
+		)
+
+		return dependencyConfig.MockOutputs, nil
+	}
+
+	// At this point, we expect outputs to exist because there is a `dependency` block without skip_outputs = true, and
+	// returning mocks is not allowed. So return a useful error message indicating that we expected outputs, but they
+	// did not exist.
+	err := TerragruntOutputTargetNoOutputs{
+		targetName:    dependencyConfig.Name,
+		targetPath:    dependencyConfig.ConfigPath.AsString(),
+		targetConfig:  targetConfig,
+		currentConfig: pctx.TerragruntConfigPath,
+	}
+
+	return nil, err
+}
+
+// We should only return default outputs if the mock_outputs attribute is set, and if we are running one of the
+// allowed commands when `mock_outputs_allowed_terraform_commands` is set as well.
+func (dep *Dependency) shouldReturnMockOutputs(pctx *ParsingContext) bool {
+	if dep.isDisabled() {
+		return true
+	}
+
+	defaultOutputsSet := dep.MockOutputs != nil
+
+	allowedCommand :=
+		dep.MockOutputsAllowedTerraformCommands == nil ||
+			len(*dep.MockOutputsAllowedTerraformCommands) == 0 ||
+			slices.Contains(*dep.MockOutputsAllowedTerraformCommands, pctx.OriginalTerraformCommand)
+
+	return defaultOutputsSet && allowedCommand || isRenderJSONCommand(pctx) || isRenderCommand(pctx)
+}
+
+// Return the output from the state of another module, managed by terragrunt. This function will parse the provided
+// terragrunt config and extract the desired output from the remote state. Note that this will error if the targeted
+// module hasn't been applied yet.
+func getTerragruntOutput(
+	ctx context.Context,
+	pctx *ParsingContext,
+	l log.Logger,
+	dependencyConfig *Dependency,
+) (*cty.Value, bool, error) {
+	// target config check: make sure the target config exists
+	targetConfigPath := getCleanedTargetConfigPath(
+		dependencyConfig.ConfigPath.AsString(),
+		pctx.TerragruntConfigPath,
+	)
+
+	// Check if config_path points to a directory containing a stack file. If so,
+	// resolve outputs from all units in the stack as a nested map.
+	stackOutput, handled, err := tryGetStackOutput(ctx, pctx, l, targetConfigPath, dependencyConfig)
+	if handled {
+		return stackOutput, stackOutput == nil, err
+	}
+
+	if !util.FileExists(targetConfigPath) {
+		return nil, true, DependencyConfigNotFound{Path: targetConfigPath}
+	}
+
+	jsonBytes, err := getOutputJSONWithCaching(ctx, pctx, l, targetConfigPath)
+	if err != nil {
+		if !isRenderJSONCommand(pctx) && !isRenderCommand(pctx) && !isAwsS3NoSuchKey(err) {
+			return nil, true, err
+		}
+
+		l.Warnf(
+			"Failed to read outputs from %s referenced in %s as %s, fallback to mock outputs. Error: %v",
+			targetConfigPath,
+			pctx.TerragruntConfigPath,
+			dependencyConfig.Name,
+			err,
+		)
+
+		jsonBytes, err = json.Marshal(dependencyConfig.MockOutputs)
+		if err != nil {
+			return nil, true, err
+		}
+	}
+
+	isEmpty := string(jsonBytes) == "{}"
+
+	outputMap, err := TerraformOutputJSONToCtyValueMap(targetConfigPath, jsonBytes)
+	if err != nil {
+		return nil, isEmpty, err
+	}
+
+	// We need to convert the value map to a single cty.Value at the end for use in the terragrunt config.
+	convertedOutput, err := gocty.ToCtyValue(outputMap, generateTypeFromValuesMap(outputMap))
+	if err != nil {
+		err = TerragruntOutputEncodingError{Path: targetConfigPath, Err: err}
+	}
+
+	return &convertedOutput, isEmpty, err
+}
+
+// collectStackUnitOutputs aggregates per-unit outputs keyed by unit name for dependency.<stack>.outputs.<unit>.<key> resolution.
+func collectStackUnitOutputs(ctx context.Context, pctx *ParsingContext, l log.Logger, stackDir string, units []*Unit) (map[string]cty.Value, error) {
+	unitOutputs := make(map[string]cty.Value)
+
+	for _, unit := range units {
+		unitDir := unit.GeneratedPath(stackDir)
+		unitConfigPath := filepath.Join(unitDir, DefaultTerragruntConfigPath)
+
+		if !util.FileExists(unitConfigPath) {
+			l.Warnf("Stack unit %s config not found at %s, skipping", unit.Name, unitConfigPath)
+
+			continue
+		}
+
+		jsonBytes, err := getOutputJSONWithCaching(ctx, pctx, l, unitConfigPath)
+		if err != nil {
+			return nil, fmt.Errorf("stack unit %s output fetch failed: %w", unit.Name, err)
+		}
+
+		outputMap, err := TerraformOutputJSONToCtyValueMap(unitConfigPath, jsonBytes)
+		if err != nil {
+			return nil, fmt.Errorf("stack unit %s output parse failed: %w", unit.Name, err)
+		}
+
+		if len(outputMap) > 0 {
+			convertedOutput, err := gocty.ToCtyValue(outputMap, generateTypeFromValuesMap(outputMap))
+			if err != nil {
+				return nil, fmt.Errorf("stack unit %s output convert failed: %w", unit.Name, err)
+			}
+
+			unitOutputs[unit.Name] = convertedOutput
+		}
+	}
+
+	return unitOutputs, nil
+}
+
+// tryGetStackOutput checks if targetConfigPath points to a stack directory
+// (contains terragrunt.stack.hcl) and resolves aggregated outputs from all
+// units in the stack. Returns (output, handled, error) where handled=true
+// means the path was a stack and was processed (even if there was an error).
+func tryGetStackOutput(
+	ctx context.Context,
+	pctx *ParsingContext,
+	l log.Logger,
+	targetConfigPath string,
+	dependencyConfig *Dependency,
+) (*cty.Value, bool, error) {
+	stackFilePath, isStackCandidate := resolveStackFilePath(dependencyConfig.ConfigPath.AsString(), targetConfigPath)
+	if !isStackCandidate {
+		return nil, false, nil
+	}
+
+	if !util.FileExists(stackFilePath) {
+		return nil, false, nil
+	}
+
+	l.Debugf("Dependency %s points to stack %s, resolving stack outputs", dependencyConfig.Name, stackFilePath)
+
+	stackDir := filepath.Dir(stackFilePath)
+
+	// Load values from the target stack's directory before parsing,
+	// mirroring the GenerateStackFile flow so stacks using values.* work.
+	stackValues, err := ReadValues(ctx, pctx, l, stackDir)
+	if err != nil {
+		return nil, true, fmt.Errorf("failed to read values for stack %s: %w", stackFilePath, err)
+	}
+
+	// Parse the stack config to discover units
+	stackConfig, err := ReadStackConfigFile(ctx, l, pctx, stackFilePath, stackValues)
+	if err != nil {
+		return nil, true, fmt.Errorf("failed to parse stack config %s: %w", stackFilePath, err)
+	}
+
+	unitOutputs, err := collectStackUnitOutputs(ctx, pctx, l, stackDir, stackConfig.Units)
+	if err != nil {
+		return nil, true, fmt.Errorf("failed to collect stack unit outputs for %s: %w", stackFilePath, err)
+	}
+
+	if len(unitOutputs) == 0 {
+		return nil, true, nil
+	}
+
+	result := cty.ObjectVal(unitOutputs)
+
+	return &result, true, nil
+}
+
+// resolveStackFilePath returns the candidate terragrunt.stack.hcl path for a dependency target; ok=false when the dep points at a unit config.
+func resolveStackFilePath(rawConfigPath, targetConfigPath string) (string, bool) {
+	switch filepath.Base(filepath.Clean(rawConfigPath)) {
+	case DefaultStackFile:
+		// Honor the contract even when target is malformed: anchor on target's directory.
+		return filepath.Join(filepath.Dir(targetConfigPath), DefaultStackFile), true
+	case DefaultTerragruntConfigPath, DefaultTerragruntJSONConfigPath:
+		return "", false
+	}
+
+	switch filepath.Base(targetConfigPath) {
+	case DefaultStackFile:
+		return targetConfigPath, true
+	case DefaultTerragruntConfigPath, DefaultTerragruntJSONConfigPath:
+		return filepath.Join(filepath.Dir(targetConfigPath), DefaultStackFile), true
+	default:
+		return filepath.Join(targetConfigPath, DefaultStackFile), true
+	}
+}
+
+func isAwsS3NoSuchKey(err error) bool {
+	if err != nil {
+		errStr := err.Error()
+		return strings.Contains(errStr, "NoSuchKey") || strings.Contains(errStr, "NotFound")
+	}
+
+	return false
+}
+
+// isRenderJSONCommand This function will true if terragrunt was invoked with render-json
+func isRenderJSONCommand(pctx *ParsingContext) bool {
+	if pctx.TerraformCliArgs == nil {
+		return false
+	}
+
+	return pctx.TerraformCliArgs.Contains(renderJSONCommand)
+}
+
+// isRenderCommand will return true if terragrunt was invoked with render
+func isRenderCommand(pctx *ParsingContext) bool {
+	if pctx.TerraformCliArgs == nil {
+		return false
+	}
+
+	return pctx.TerraformCliArgs.Contains(renderCommand)
+}
+
+type dependencyNameKey struct{}
+
+// contextWithDependencyName tags ctx with the HCL `dependency "<name>"` block label so
+// dependency_output_fetch can include it as a span attribute.
+func contextWithDependencyName(ctx context.Context, name string) context.Context {
+	return context.WithValue(ctx, dependencyNameKey{}, name)
+}
+
+// dependencyNameFromContext returns the dependency block name attached to ctx, or "".
+func dependencyNameFromContext(ctx context.Context) string {
+	if v, ok := ctx.Value(dependencyNameKey{}).(string); ok {
+		return v
+	}
+
+	return ""
+}
+
+// getOutputJSONWithCaching will run terragrunt output on the target config if it is not already cached.
+func getOutputJSONWithCaching(ctx context.Context, pctx *ParsingContext, l log.Logger, targetConfig string) ([]byte, error) {
+	locks := outputLocksFromContext(ctx)
+
+	locks.Lock(targetConfig)
+	defer locks.Unlock(targetConfig)
+
+	l.Debugf("Getting output of dependency %s for config %s", util.RelPathForLog(pctx.RootWorkingDir, targetConfig, pctx.Writers.LogShowAbsPaths), util.RelPathForLog(pctx.RootWorkingDir, pctx.TerragruntConfigPath, pctx.Writers.LogShowAbsPaths))
+
+	var newJSONBytes []byte
+
+	fetchAttrs := map[string]any{
+		"target": targetConfig,
+		"caller": pctx.TerragruntConfigPath,
+	}
+	if name := dependencyNameFromContext(ctx); name != "" {
+		fetchAttrs["dependency_name"] = name
+	}
+
+	err := telemetry.TelemeterFromContext(ctx).Collect(ctx, "dependency_output_fetch", fetchAttrs, func(fetchCtx context.Context) error {
+		jsonCache := cache.ContextCache[[]byte](fetchCtx, JSONOutputCacheContextKey)
+		if cached, found := jsonCache.Get(fetchCtx, targetConfig); found {
+			l.Debugf("%s was run before. Using cached output.", targetConfig)
+
+			if span := trace.SpanFromContext(fetchCtx); span.IsRecording() {
+				span.SetAttributes(attribute.Bool("cache_hit", true))
+			}
+
+			newJSONBytes = cached
+
+			return nil
+		}
+
+		fetched, strategy, fetchErr := resolveOutputJSON(fetchCtx, pctx, l, targetConfig)
+
+		if span := trace.SpanFromContext(fetchCtx); span.IsRecording() {
+			span.SetAttributes(attribute.Bool("cache_hit", false))
+
+			if strategy != "" {
+				span.SetAttributes(attribute.String("strategy", strategy))
+			}
+		}
+
+		if fetchErr != nil {
+			return fetchErr
+		}
+
+		// `tofu/terraform output -json` stdout can be polluted with non-JSON text on either side of the JSON object:
+		//   - Leading: AWS Client Side Monitoring (CSM) logs (e.g., "2023/05/04 20:22:43 Enabling CSM"),
+		//     ANSI color escape sequences from warning blocks.
+		//     Refs: https://github.com/aws/aws-sdk-go/blob/81d1cbbc6a2028023aff7bcab0fe1be320cd39f7/aws/session/session.go#L444
+		//           https://github.com/gruntwork-io/terragrunt/issues/2233
+		//   - Trailing: Terraform 1.15+ emits backend deprecation warnings (e.g., for the S3
+		//     `dynamodb_table` parameter) on stdout after the JSON has already been printed.
+		//     Refs: https://github.com/gruntwork-io/terragrunt/issues/6001
+		//
+		// To make parsing robust to either, isolate the first JSON object in the buffer.
+		trimmed, trimErr := extractFirstJSONObject(fetched)
+		if trimErr != nil {
+			return TerragruntOutputParsingError{Path: targetConfig, Err: trimErr}
+		}
+
+		newJSONBytes = trimmed
+		jsonCache.Put(fetchCtx, targetConfig, newJSONBytes)
+
+		return nil
+	})
+	if err != nil {
+		return nil, err
+	}
+
+	return newJSONBytes, nil
+}
+
+// extractFirstJSONObject returns the first complete JSON object found in data, ignoring any
+// non-JSON content that precedes or follows it. This is needed because `tofu/terraform output -json`
+// can intermix log lines, ANSI escape codes, or deprecation warnings with the JSON output, depending
+// on the version and backend in use.
+//
+// If data contains no `{`, the original bytes are returned so downstream JSON parsing surfaces the
+// usual "unexpected end of JSON input" error rather than a cryptic message from this helper.
+func extractFirstJSONObject(data []byte) ([]byte, error) {
+	start := bytes.IndexByte(data, '{')
+	if start < 0 {
+		return data, nil
+	}
+
+	dec := json.NewDecoder(bytes.NewReader(data[start:]))
+
+	var raw json.RawMessage
+	if err := dec.Decode(&raw); err != nil {
+		return nil, err
+	}
+
+	return raw, nil
+}
+
+// resolveOutputJSON retrieves the outputs from the terraform state in the target configuration. It
+// attempts to optimize retrieval if the following conditions are true:
+//   - State backends are managed with a `remote_state` block.
+//   - The `remote_state` block does not depend on any `dependency` outputs.
+//
+// If these conditions are met, terragrunt can avoid recursively retrieving dependency outputs by
+// pulling the state file directly. Otherwise it falls back to running `terragrunt output`.
+//
+// The returned strategy string ("run", "state", or "init_folder") is purely for telemetry
+// annotation on the caller's span; callers should not branch on it.
+func resolveOutputJSON(ctx context.Context, pctx *ParsingContext, l log.Logger, targetConfig string) ([]byte, string, error) {
+	l, pctx, err := pctx.WithDependencyConfigPath(l, targetConfig)
+	if err != nil {
+		return nil, "", err
+	}
+
+	// Set dependency-specific fields
+	pctx.ForwardTFStdout = false
+	pctx.CheckDependentUnits = false
+	pctx.TerraformCommand = "output"
+	pctx.TerraformCliArgs = iacargs.New().SetCommand("output").AppendFlag("-json")
+
+	// Clear IAM if changed from original
+	if pctx.IAMRoleOptions != pctx.OriginalIAMRoleOptions {
+		pctx.IAMRoleOptions = iam.RoleOptions{}
+	}
+
+	// Validate and use TerragruntVersionConstraints.TerraformBinary for dependency
+	partialTerragruntConfig, err := PartialParseConfigFile(
+		ctx,
+		pctx.WithDecodeList(DependencyBlock).WithDiagnosticsSuppressed(l),
+		l,
+		targetConfig,
+		nil,
+	)
+	if err != nil {
+		return nil, "", err
+	}
+
+	// Only override TFPath if it was not explicitly set by the user via CLI or environment variable
+	if !pctx.TFPathExplicitlySet && partialTerragruntConfig.TerraformBinary != "" {
+		pctx.TFPath = partialTerragruntConfig.TerraformBinary
+	}
+
+	// If the Source is set, then we need to recompute it in the ctx of the target config.
+	if pctx.Source != "" {
+		partialParseIncludedConfig, err := PartialParseConfigFile(
+			ctx,
+			pctx.WithDecodeList(TerraformBlock).WithDiagnosticsSuppressed(l),
+			l,
+			targetConfig,
+			nil,
+		)
+		if err != nil {
+			return nil, "", err
+		}
+		// Update the source value to be everything before "//" so that it can be recomputed
+		moduleURL, _ := getter.SourceDirSubdir(pctx.Source)
+
+		// Finally, update the source to be the combined path between the terraform source in the target config, and the
+		// value before "//" in the original terragrunt options.
+		targetSource, err := GetTerragruntSourceForModule(moduleURL, filepath.Dir(targetConfig), partialParseIncludedConfig)
+		if err != nil {
+			return nil, "", err
+		}
+
+		pctx.Source = targetSource
+	}
+
+	// First attempt to parse the `remote_state` blocks without parsing/getting dependency outputs. If this is possible,
+	// proceed to routine that fetches remote state directly. Otherwise, fallback to calling `terragrunt output`
+	// directly.
+
+	// we need to suspend logging diagnostic errors on this attempt
+	parseOptions := slices.Concat(pctx.ParserOptions, []hclparse.Option{hclparse.WithDiagnosticsWriter(io.Discard, true)})
+
+	remoteStateTGConfig, err := PartialParseConfigFile(
+		ctx,
+		pctx.WithParseOption(parseOptions).WithDecodeList(
+			RemoteStateBlock,
+			TerragruntFlags,
+			EngineBlock,
+		),
+		l,
+		targetConfig,
+		nil,
+	)
+	canGet := canGetRemoteState(remoteStateTGConfig.RemoteState)
+
+	if err != nil || !canGet {
+		l.Debugf("Could not parse remote_state block from target config %s", pctx.TerragruntConfigPath)
+		l.Debugf("Falling back to terragrunt output.")
+
+		out, runErr := runTerragruntOutputJSON(ctx, pctx, l, targetConfig)
+
+		return out, "run", runErr
+	}
+
+	// In optimization mode, see if there is already an init-ed folder that terragrunt can use, and if so, run
+	// `terraform output` in the working directory.
+	isInit, workingDir, err := terragruntAlreadyInit(ctx, l, pctx, targetConfig)
+	if err != nil {
+		return nil, "", err
+	}
+
+	// Fetch engine options so they can be passed to the dependency functions
+	engineOpts, err := remoteStateTGConfig.EngineOptions()
+	if err != nil {
+		return nil, "", err
+	}
+
+	pctx.EngineConfig = engineOpts
+
+	shouldFetchFromState := pctx.Experiments.Evaluate(experiment.DependencyFetchOutputFromState) &&
+		!pctx.NoDependencyFetchOutputFromState &&
+		remoteStateTGConfig.RemoteState.BackendName == s3backend.BackendName
+
+	if shouldFetchFromState {
+		out, fetchErr := getTerragruntOutputJSONFromRemoteState(
+			ctx,
+			pctx,
+			l,
+			targetConfig,
+			remoteStateTGConfig.RemoteState,
+			remoteStateTGConfig.GetIAMRoleOptions(),
+		)
+
+		return out, "state", fetchErr
+	}
+
+	if isInit {
+		mergedIAM := iam.MergeRoleOptions(remoteStateTGConfig.GetIAMRoleOptions(), pctx.OriginalIAMRoleOptions)
+		if err = creds.NewGetter().ObtainAndUpdateEnvIfNecessary(
+			ctx,
+			l,
+			pctx.Venv.Exec,
+			pctx.Env,
+			externalcmd.NewProvider(l, pctx.AuthProviderCmd, shellRunOptsFromPctx(pctx)),
+			amazonsts.NewProvider(l, mergedIAM, pctx.Env),
+		); err != nil {
+			return nil, "", err
+		}
+
+		out, fetchErr := getTerragruntOutputJSONFromInitFolder(
+			ctx,
+			pctx,
+			l,
+			workingDir,
+		)
+
+		return out, "init_folder", fetchErr
+	}
+
+	out, fetchErr := getTerragruntOutputJSONFromRemoteState(
+		ctx,
+		pctx,
+		l,
+		targetConfig,
+		remoteStateTGConfig.RemoteState,
+		remoteStateTGConfig.GetIAMRoleOptions(),
+	)
+
+	return out, "state", fetchErr
+}
+
+// canGetRemoteState returns true if the remote state block is not nil and dependency optimization is not disabled
+func canGetRemoteState(remoteState *remotestate.RemoteState) bool {
+	return remoteState != nil && !remoteState.DisableDependencyOptimization
+}
+
+// terragruntAlreadyInit returns true if it detects that the module specified by the given terragrunt configuration is
+// already initialized with the terraform source. This will also return the working directory where you can run
+// terraform.
+func terragruntAlreadyInit(ctx context.Context, l log.Logger, pctx *ParsingContext, configPath string) (bool, string, error) {
+	// We need to first determine the working directory where the terraform source should be located. This is dependent
+	// on the source field of the terraform block in the config.
+	terraformBlockTGConfig, err := PartialParseConfigFile(ctx, pctx.WithDecodeList(TerraformSource), l, configPath, nil)
+	if err != nil {
+		return false, "", err
+	}
+
+	sourceURL, err := GetTerraformSourceURL(pctx.Source, pctx.SourceMap, pctx.OriginalTerragruntConfigPath, terraformBlockTGConfig)
+	if err != nil {
+		return false, "", err
+	}
+
+	// sourceURL will always be at least "." (current directory) to ensure cache is always used.
+	// Always compute the cache working directory using NewSource.
+	walkWithSymlinks := pctx.Experiments.Evaluate(experiment.Symlinks)
+	// Apply the rewrite so the .terraform existence check below targets the
+	// same working dir the downloader writes to. Without it, plain
+	// https://www.googleapis.com/storage/... sources force a redundant init
+	// on every run.
+	sourceURL = tf.RewriteLegacyGCSPublicSource(ctx, l, sourceURL, pctx.StrictControls)
+
+	terraformSource, err := tf.NewSource(l, sourceURL, pctx.DownloadDir, pctx.WorkingDir, walkWithSymlinks)
+	if err != nil {
+		return false, "", err
+	}
+	// We're only interested in the computed working dir.
+	workingDir := terraformSource.WorkingDir
+	// Terragrunt is already init-ed if the terraform state dir (.terraform) exists in the working dir.
+	// NOTE: if the ref changes, the workingDir would be different as the download dir includes a base64 encoded hash of
+	// the source URL with ref. This would ensure that this routine would not return true if the new ref is not already
+	// init-ed.
+	return util.FileExists(filepath.Join(workingDir, ".terraform")), workingDir, nil
+}
+
+// getTerragruntOutputJSONFromInitFolder will retrieve the outputs directly from the module's working directory without
+// running init. Callers must populate pctx.Env with auth-provider-cmd credentials and any
+// TG_IAM_ROLE assumption beforehand.
+func getTerragruntOutputJSONFromInitFolder(
+	ctx context.Context,
+	pctx *ParsingContext,
+	l log.Logger,
+	terraformWorkingDir string,
+) ([]byte, error) {
+	targetConfigPath := pctx.TerragruntConfigPath
+
+	tfRunOpts := setupTFRunOptsForBareTerraform(pctx, terraformWorkingDir)
+
+	l.Debugf(
+		"Unit '%s' is already init-ed. "+
+			"Retrieving outputs directly from working directory.",
+		util.RelPathForLog(
+			pctx.RootWorkingDir,
+			filepath.Dir(targetConfigPath),
+			pctx.Writers.LogShowAbsPaths,
+		),
+	)
+
+	bareCtx := tf.ContextWithTerraformCommandHook(ctx, nil)
+
+	out, err := tf.RunCommandWithOutput(bareCtx, l, pctx.Venv.Exec, tfRunOpts, tf.CommandNameOutput, "-json")
+	if err != nil {
+		return nil, err
+	}
+
+	jsonString := strings.TrimSpace(out.Stdout.String())
+	jsonBytes := []byte(jsonString)
+
+	l.Debugf(
+		"Retrieved output from %s as json: %s",
+		util.RelPathForLog(
+			pctx.RootWorkingDir,
+			targetConfigPath,
+			pctx.Writers.LogShowAbsPaths,
+		),
+		jsonString,
+	)
+
+	return jsonBytes, nil
+}
+
+// getTerragruntOutputJSONFromRemoteState will retrieve the outputs directly by using just the remote state block. This
+// uses terraform's feature where `output` and `init` can work without the real source, as long as you have the
+// `backend` configured.
+// To do this, this function will:
+// - Create a temporary folder
+// - Generate the backend.tf file with the backend configuration from the remote_state block
+// - Copy the provider lock file, if there is one in the dependency's working directory
+// - Run terraform init and terraform output
+// - Clean up folder once json file is generated
+// NOTE: terragruntOptions should be in the ctx of the targetConfig already.
+func getTerragruntOutputJSONFromRemoteState(
+	ctx context.Context,
+	pctx *ParsingContext,
+	l log.Logger,
+	targetConfigPath string,
+	remoteState *remotestate.RemoteState,
+	iamRoleOpts iam.RoleOptions,
+) ([]byte, error) {
+	l.Debugf("Detected remote state block with generate config. Resolving dependency by pulling remote state.")
+	// Create working directory where we will run terraform in. We will create the temporary directory in the download
+	// directory for consistency with other file generation capabilities of terragrunt. Make sure it is cleaned up
+	// before the function returns.
+	if err := util.EnsureDirectory(pctx.DownloadDir); err != nil {
+		return nil, err
+	}
+
+	tempWorkDir, err := os.MkdirTemp(pctx.DownloadDir, "")
+	if err != nil {
+		return nil, err
+	}
+
+	defer func(path string) {
+		err := os.RemoveAll(path)
+		if err != nil {
+			l.Warnf("Failed to remove %s: %v", path, err)
+		}
+	}(tempWorkDir)
+
+	l.Debugf("Setting dependency working directory to %s", tempWorkDir)
+
+	mergedIAM := iam.MergeRoleOptions(iamRoleOpts, pctx.OriginalIAMRoleOptions)
+	if err = creds.NewGetter().ObtainAndUpdateEnvIfNecessary(
+		ctx,
+		l,
+		pctx.Venv.Exec,
+		pctx.Env,
+		externalcmd.NewProvider(l, pctx.AuthProviderCmd, shellRunOptsFromPctx(pctx)),
+		amazonsts.NewProvider(l, mergedIAM, pctx.Env),
+	); err != nil {
+		return nil, err
+	}
+
+	tfRunOpts := setupTFRunOptsForBareTerraform(pctx, tempWorkDir)
+
+	// To speed up dependencies processing it is possible to retrieve its output directly from the backend without init dependencies
+	if pctx.Experiments.Evaluate(experiment.DependencyFetchOutputFromState) && !pctx.NoDependencyFetchOutputFromState {
+		switch backend := remoteState.BackendName; backend {
+		case s3backend.BackendName:
+			jsonBytes, s3GetErr := getTerragruntOutputJSONFromRemoteStateS3(
+				ctx,
+				l,
+				pctx,
+				remoteState,
+			)
+			if s3GetErr != nil {
+				return nil, s3GetErr
+			}
+
+			l.Debugf("Retrieved output from %s as json: %s using s3 bucket", pctx.TerragruntConfigPath, jsonBytes)
+
+			return jsonBytes, nil
+		default:
+			l.Debugf("dependency-fetch-output-from-state experiment is not supported for backend %s, falling back to default output retrieval", backend)
+		}
+	}
+
+	// Generate the backend configuration in the working dir. If no generate config is set on the remote state block,
+	// set a temporary generate config so we can generate the backend code.
+	if remoteState.Generate == nil {
+		remoteState.Generate = &remotestate.ConfigGenerate{
+			Path:     "backend.tf",
+			IfExists: codegen.ExistsOverwriteTerragruntStr,
+		}
+	}
+
+	if err := remoteState.GenerateOpenTofuCode(l, tempWorkDir); err != nil {
+		return nil, err
+	}
+
+	l.Debugf("Generated remote state configuration in working dir %s", tempWorkDir)
+
+	// Check for a provider lock file and copy it to the working dir if it exists.
+	terragruntDir := filepath.Dir(pctx.TerragruntConfigPath)
+	if err := CopyLockFile(l, pctx.RootWorkingDir, pctx.Writers.LogShowAbsPaths, terragruntDir, tempWorkDir); err != nil {
+		return nil, err
+	}
+
+	// The working directory is now set up to interact with the state, so pull it down to get the json output.
+
+	// Clone pctx and discard init stdout so it doesn't leak into the caller's output buffer.
+	initPctx := pctx.Clone()
+	initPctx.Writers.Writer = io.Discard
+
+	// First run init to setup the backend configuration so that we can run output.
+	runTerraformInitForDependencyOutput(ctx, initPctx, l, tempWorkDir)
+
+	// Now that the backend is initialized, run terraform output to get the data and return it.
+	bareCtx := tf.ContextWithTerraformCommandHook(ctx, nil)
+
+	out, err := tf.RunCommandWithOutput(bareCtx, l, pctx.Venv.Exec, tfRunOpts, tf.CommandNameOutput, "-json")
+	if err != nil {
+		return nil, err
+	}
+
+	jsonString := strings.TrimSpace(out.Stdout.String())
+	jsonBytes := []byte(jsonString)
+	l.Debugf("Retrieved output from %s as json: %s", targetConfigPath, jsonString)
+
+	return jsonBytes, nil
+}
+
+// getTerragruntOutputJSONFromRemoteStateS3 pulls the output directly from an S3 bucket without calling Terraform
+func getTerragruntOutputJSONFromRemoteStateS3(ctx context.Context, l log.Logger, pctx *ParsingContext, remoteState *remotestate.RemoteState) ([]byte, error) {
+	bucket := fmt.Sprintf("%s", remoteState.BackendConfig["bucket"])
+	key := fmt.Sprintf("%s", remoteState.BackendConfig["key"])
+
+	l.Debugf("Fetching outputs directly from s3://%s/%s", bucket, key)
+
+	var jsonOutputs []byte
+
+	err := telemetry.TelemeterFromContext(ctx).Collect(ctx, "dependency_output_state_s3", map[string]any{
+		"bucket": bucket,
+		"key":    key,
+	}, func(ctx context.Context) error {
+		s3ConfigExtended, err := s3backend.Config(remoteState.BackendConfig).ParseExtendedS3Config()
+		if err != nil {
+			return fmt.Errorf("parsing s3 backend config for s3://%s/%s: %w", bucket, key, err)
+		}
+
+		sessionConfig := s3ConfigExtended.GetAwsSessionConfig()
+
+		s3Client, err := awshelper.NewAWSConfigBuilder().
+			WithSessionConfig(sessionConfig).
+			WithEnv(pctx.Env).
+			WithIAMRoleOptions(pctx.IAMRoleOptions).
+			BuildS3Client(ctx, l)
+		if err != nil {
+			return fmt.Errorf("building s3 client for s3://%s/%s: %w", bucket, key, err)
+		}
+
+		result, err := s3Client.GetObject(ctx, &s3.GetObjectInput{
+			Bucket: aws.String(bucket),
+			Key:    aws.String(key),
+		})
+		if err != nil {
+			return fmt.Errorf("fetching dependency state from s3://%s/%s: %w", bucket, key, err)
+		}
+
+		defer func(Body io.ReadCloser) {
+			err := Body.Close()
+			if err != nil {
+				l.Warnf("Failed to close remote state response %v", err)
+			}
+		}(result.Body)
+
+		steateBody, err := io.ReadAll(result.Body)
+		if err != nil {
+			return fmt.Errorf("reading dependency state body from s3://%s/%s: %w", bucket, key, err)
+		}
+
+		jsonMap := make(map[string]any)
+		if err := json.Unmarshal(steateBody, &jsonMap); err != nil {
+			return fmt.Errorf("parsing dependency state JSON from s3://%s/%s: %w", bucket, key, err)
+		}
+
+		jsonOutputs, err = json.Marshal(jsonMap["outputs"])
+		if err != nil {
+			return fmt.Errorf("encoding outputs from dependency state at s3://%s/%s: %w", bucket, key, err)
+		}
+
+		return nil
+	})
+	if err != nil {
+		return nil, err
+	}
+
+	return jsonOutputs, nil
+}
+
+// setupTFRunOptsForBareTerraform builds a *tf.TFOptions for running terraform without
+// going through the full RunTerragrunt operation. Callers must obtain credentials
+// (auth-provider-cmd and any TG_IAM_ROLE assumption) before invoking, so those steps
+// run from the unit's directory rather than the bare-terraform working directory.
+func setupTFRunOptsForBareTerraform(pctx *ParsingContext, workingDir string) *tf.TFOptions {
+	shellOpts := shellRunOptsFromPctx(pctx)
+	shellOpts.WorkingDir = workingDir
+	shellOpts.Writers.Writer = io.Discard
+
+	return &tf.TFOptions{
+		JSONLogFormat:                pctx.JSONLogFormat,
+		OriginalTerragruntConfigPath: pctx.OriginalTerragruntConfigPath,
+		ShellOptions:                 shellOpts,
+	}
+}
+
+// runTerragruntOutputJSON uses terragrunt running functions to extract the json output from the target config.
+func runTerragruntOutputJSON(ctx context.Context, pctx *ParsingContext, l log.Logger, targetConfig string) ([]byte, error) {
+	// Update the stdout buffer so we can capture the output
+	var stdoutBuffer bytes.Buffer
+
+	stdoutBufferWriter := bufio.NewWriter(&stdoutBuffer)
+
+	// Override pctx for this specific operation
+	pctx = pctx.Clone()
+	pctx.ForwardTFStdout = false
+	pctx.JSONLogFormat = false
+	pctx.Writers.Writer = stdoutBufferWriter
+
+	cfg, err := ParseConfigFile(ctx, pctx, l, pctx.TerragruntConfigPath, nil)
+	if err != nil {
+		return nil, err
+	}
+
+	runCfg := cfg.ToRunConfig(l)
+
+	credsGetter := creds.NewGetter()
+	if err = credsGetter.ObtainAndUpdateEnvIfNecessary(
+		ctx,
+		l,
+		pctx.Venv.Exec,
+		pctx.Env,
+		externalcmd.NewProvider(l, pctx.AuthProviderCmd, shellRunOptsFromPctx(pctx)),
+	); err != nil {
+		return nil, err
+	}
+
+	// Build run.Options directly from ParsingContext fields.
+	// Override Writers.Writer to capture stdout, and force ForwardTFStdout/JSONLogFormat off.
+	runWriters := pctx.Writers
+	runWriters.Writer = stdoutBufferWriter
+
+	runOpts := run.NewOptions()
+	runOpts.Writers = runWriters
+	runOpts.TerragruntConfigPath = pctx.TerragruntConfigPath
+	runOpts.OriginalTerragruntConfigPath = pctx.OriginalTerragruntConfigPath
+	runOpts.WorkingDir = pctx.WorkingDir
+	runOpts.RootWorkingDir = pctx.RootWorkingDir
+	runOpts.DownloadDir = pctx.DownloadDir
+	runOpts.Source = pctx.Source
+	runOpts.SourceMap = pctx.SourceMap
+	runOpts.TerraformCommand = pctx.TerraformCommand
+	runOpts.OriginalTerraformCommand = pctx.OriginalTerraformCommand
+	runOpts.TerraformCliArgs = pctx.TerraformCliArgs
+	runOpts.Env = pctx.Env
+	runOpts.IAMRoleOptions = pctx.IAMRoleOptions
+	runOpts.OriginalIAMRoleOptions = pctx.OriginalIAMRoleOptions
+	runOpts.Experiments = pctx.Experiments
+	runOpts.StrictControls = pctx.StrictControls
+	runOpts.FeatureFlags = pctx.FeatureFlags
+	runOpts.EngineConfig = pctx.EngineConfig
+	runOpts.EngineOptions = pctx.EngineOptions
+	runOpts.TFPath = pctx.TFPath
+	runOpts.TofuImplementation = pctx.TofuImplementation
+	runOpts.Headless = pctx.Headless
+	runOpts.Debug = pctx.Debug
+	runOpts.AutoInit = pctx.AutoInit
+	runOpts.BackendBootstrap = pctx.BackendBootstrap
+	runOpts.Telemetry = pctx.Telemetry
+	runOpts.AuthProviderCmd = pctx.AuthProviderCmd
+	runOpts.CASCloneDepth = pctx.CASCloneDepth
+
+	err = run.Run(ctx, l, run.FromRoot(pctx.Venv), runOpts, report.NewReport(), runCfg, credsGetter)
+	if err != nil {
+		return nil, err
+	}
+
+	err = stdoutBufferWriter.Flush()
+	if err != nil {
+		return nil, err
+	}
+
+	jsonString := strings.TrimSpace(stdoutBuffer.String())
+	jsonBytes := []byte(jsonString)
+
+	l.Debugf("Retrieved output from %s as json: %s", targetConfig, jsonString)
+
+	return jsonBytes, nil
+}
+
+// shellRunOptsFromPctx builds a *shell.ShellOptions from ParsingContext flat fields.
+func shellRunOptsFromPctx(pctx *ParsingContext) *shell.ShellOptions {
+	return shell.NewShellOptions().
+		WithWorkingDir(pctx.WorkingDir).
+		WithEnv(pctx.Env).
+		WithWriters(pctx.Writers).
+		WithTelemetry(pctx.Telemetry).
+		WithEngine(pctx.EngineConfig, pctx.EngineOptions).
+		WithTFPath(pctx.TFPath).
+		WithRootWorkingDir(pctx.RootWorkingDir).
+		WithExperiments(pctx.Experiments).
+		WithHeadless(pctx.Headless).
+		WithForwardTFStdout(pctx.ForwardTFStdout)
+}
+
+// tfRunOptsFromPctx builds a *tf.RunOptions from ParsingContext flat fields.
+func tfRunOptsFromPctx(pctx *ParsingContext) *tf.TFOptions {
+	return &tf.TFOptions{
+		JSONLogFormat:                pctx.JSONLogFormat,
+		OriginalTerragruntConfigPath: pctx.OriginalTerragruntConfigPath,
+		ShellOptions:                 shellRunOptsFromPctx(pctx),
+	}
+}
+
+// TerraformOutputJSONToCtyValueMap takes the terraform output json and converts to a mapping between output keys to the
+// parsed cty.Value encoding of the json objects.
+func TerraformOutputJSONToCtyValueMap(targetConfigPath string, jsonBytes []byte) (map[string]cty.Value, error) {
+	// When getting all outputs, terraform returns a json with the data containing metadata about the types, so we
+	// can't quite return the data directly. Instead, we will need further processing to get the output we want.
+	// To do so, we first Unmarshal the json into a simple go map to a OutputMeta struct.
+	type OutputMeta struct {
+		Type      json.RawMessage `json:"type"`
+		Value     json.RawMessage `json:"value"`
+		Sensitive bool            `json:"sensitive"`
+	}
+
+	var outputs map[string]OutputMeta
+
+	err := json.Unmarshal(jsonBytes, &outputs)
+	if err != nil {
+		return nil, TerragruntOutputParsingError{Path: targetConfigPath, Err: err}
+	}
+
+	flattenedOutput := map[string]cty.Value{}
+
+	for k, v := range outputs {
+		outputType, err := ctyjson.UnmarshalType(v.Type)
+		if err != nil {
+			return nil, TerragruntOutputParsingError{Path: targetConfigPath, Err: err}
+		}
+
+		outputVal, err := ctyjson.Unmarshal(v.Value, outputType)
+		if err != nil {
+			return nil, TerragruntOutputParsingError{Path: targetConfigPath, Err: err}
+		}
+
+		flattenedOutput[k] = outputVal
+	}
+
+	return flattenedOutput, nil
+}
+
+// runTerraformInitForDependencyOutput will run terraform init in a mode that doesn't pull down plugins or modules. Note
+// that this will cause the command to fail for most modules as terraform init does a validation check to make sure the
+// plugins are available, even though we don't need it for our purposes (terraform output does not depend on any of the
+// plugins being available). As such this command will ignore errors in the init command.
+// To help with debuggability, the errors will be printed to the console when TG_LOG=debug is set.
+func runTerraformInitForDependencyOutput(ctx context.Context, pctx *ParsingContext, l log.Logger, workingDir string) {
+	stderr := bytes.Buffer{}
+
+	initRunOpts := tfRunOptsFromPctx(pctx)
+	initRunOpts.ShellOptions.WorkingDir = workingDir
+	initRunOpts.ShellOptions.Writers.ErrWriter = &stderr
+
+	bareCtx := tf.ContextWithTerraformCommandHook(ctx, nil)
+
+	if err := tf.RunCommand(bareCtx, l, pctx.Venv.Exec, initRunOpts, tf.CommandNameInit, "-get=false"); err != nil {
+		l.Debugf("Ignoring expected error from dependency init call")
+		l.Debugf("Init call stderr:")
+		l.Debugf("%s", stderr.String())
+	}
+}
+
+func (deps Dependencies) FilteredWithoutConfigPath() Dependencies {
+	var filteredDeps Dependencies
+
+	for _, dep := range deps {
+		if !dep.ConfigPath.IsNull() {
+			filteredDeps = append(filteredDeps, dep)
+		}
+	}
+
+	return filteredDeps
+}
+
+// foldSiblingAutoIncludeDeps merges the registered sibling autoinclude dependency blocks over the unit's own same-name blocks (shallow, by name, with the autoinclude winning), mirroring a regular include's default merge strategy.
+func foldSiblingAutoIncludeDeps(ctx context.Context, pctx *ParsingContext, l log.Logger, deps []Dependency) ([]Dependency, error) {
+	if pctx.TrackInclude == nil || pctx.TrackInclude.AutoIncludeOverride == nil {
+		return deps, nil
+	}
+
+	autoIncludePath := pctx.TrackInclude.AutoIncludeOverride.Path
+
+	autoFile, err := parseAutoIncludeFileCached(ctx, pctx, autoIncludePath)
+	if err != nil {
+		return nil, err
+	}
+
+	// Rescope to the autoinclude's own locals so the unit's locals do not leak into the autoinclude decode.
+	autoPctx := pctx.Clone()
+	// Files the autoinclude pulls in through its own includes must not re-merge a sibling autoinclude.
+	autoPctx.skipAutoIncludeMerge = true
+
+	baseBlocks, err := DecodeBaseBlocks(ctx, autoPctx, l, autoFile, nil)
+	if err != nil {
+		return nil, err
+	}
+
+	if baseBlocks != nil {
+		autoPctx = autoPctx.WithTrackInclude(baseBlocks.TrackInclude)
+		autoPctx = autoPctx.WithFeatures(baseBlocks.FeatureFlags)
+		autoPctx = autoPctx.WithLocals(baseBlocks.Locals)
+	}
+
+	evalCtx, err := createTerragruntEvalContext(ctx, autoPctx, l, autoIncludePath)
+	if err != nil {
+		return nil, err
+	}
+
+	decoded := TerragruntDependency{}
+	if err := autoFile.Decode(&decoded, evalCtx); err != nil {
+		return nil, err
+	}
+
+	// Fold in dependency blocks the autoinclude inherits through its own include blocks, mirroring the unit decode path so inherited deps resolve before the unit body is evaluated.
+	if autoPctx.TrackInclude != nil && len(autoPctx.TrackInclude.CurrentList) > 0 {
+		merged, err := handleIncludeForDependency(ctx, autoPctx, l, decoded)
+		if err != nil {
+			return nil, err
+		}
+
+		decoded = *merged
+	}
+
+	autoDeps := decoded.Dependencies.FilteredWithoutConfigPath()
+	if len(autoDeps) == 0 {
+		return deps, nil
+	}
+
+	return mergeDependencyBlocks(deps, autoDeps), nil
+}
+
+// parseAutoIncludeFileCached parses the sibling autoinclude through the run-scoped HCL file cache so repeated dependency-output decodes reuse one parse, rebinding the shared AST to a fresh parser per call.
+func parseAutoIncludeFileCached(ctx context.Context, pctx *ParsingContext, autoIncludePath string) (*hclparse.File, error) {
+	fileInfo, err := os.Stat(autoIncludePath)
+	if err != nil {
+		return nil, err
+	}
+
+	hclCache := cache.ContextCache[*hclparse.File](ctx, HclCacheContextKey)
+	// Prefix the key so it cannot collide with the unit-config keys ParseConfigFile stores.
+	cacheKey := fmt.Sprintf("autoinclude-%v-%v", autoIncludePath, fileInfo.ModTime().UnixMicro())
+
+	if cached, found := hclCache.Get(ctx, cacheKey); found {
+		return cached.Rebind(hclparse.NewParser(pctx.ParserOptions...)), nil
+	}
+
+	file, err := hclparse.NewParser(pctx.ParserOptions...).ParseFromFile(autoIncludePath)
+	if err != nil {
+		return nil, err
+	}
+
+	hclCache.Put(ctx, cacheKey, file)
+
+	return file, nil
+}
+
+// IsValidConfigPath checks if a cty.Value is a valid, usable config path.
+func IsValidConfigPath(v cty.Value) bool {
+	if v.IsNull() || !v.IsWhollyKnown() || !v.Type().Equals(cty.String) {
+		return false
+	}
+
+	// Empty string is not a valid config path
+	if v.AsString() == "" {
+		return false
+	}
+
+	return true
+}

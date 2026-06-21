@@ -1,0 +1,319 @@
+package find
+
+import (
+	"context"
+	"encoding/json"
+	"fmt"
+	"path/filepath"
+	"strings"
+
+	"github.com/gruntwork-io/terragrunt/internal/telemetry"
+	"github.com/gruntwork-io/terragrunt/pkg/log"
+
+	"errors"
+
+	"github.com/gruntwork-io/terragrunt/internal/component"
+	"github.com/gruntwork-io/terragrunt/internal/discovery"
+	"github.com/gruntwork-io/terragrunt/internal/os/stdout"
+	"github.com/gruntwork-io/terragrunt/internal/queue"
+	"github.com/gruntwork-io/terragrunt/internal/worktrees"
+	"github.com/gruntwork-io/terragrunt/pkg/config"
+
+	"charm.land/lipgloss/v2"
+)
+
+// Run runs the find command.
+func Run(ctx context.Context, l log.Logger, opts *Options) error {
+	d, err := discovery.NewForDiscoveryCommand(l, &discovery.DiscoveryCommandOptions{
+		WorkingDir:        opts.WorkingDir,
+		QueueConstructAs:  opts.QueueConstructAs,
+		NoHidden:          opts.NoHidden,
+		WithRequiresParse: opts.Dependencies || opts.Mode == ModeDAG,
+		WithRelationships: opts.Dependencies || opts.Mode == ModeDAG,
+		Exclude:           opts.Exclude,
+		Include:           opts.Include,
+		Reading:           opts.Reading,
+		Filters:           opts.Filters,
+		Experiments:       opts.Experiments,
+	})
+	if err != nil {
+		return err
+	}
+
+	// We do worktree generation here instead of in the discovery constructor
+	// so that we can defer cleanup in the same context.
+	gitFilters := opts.Filters.UniqueGitFilters()
+
+	worktrees, worktreeErr := worktrees.NewWorktrees(ctx, l, worktrees.WorktreeOpts{
+		WorkingDir:     opts.WorkingDir,
+		GitExpressions: gitFilters,
+		Experiments:    opts.Experiments,
+	})
+	if worktreeErr != nil {
+		return fmt.Errorf("failed to create worktrees: %w", worktreeErr)
+	}
+
+	defer func() {
+		cleanupErr := worktrees.Cleanup(ctx, l)
+		if cleanupErr != nil {
+			l.Errorf("failed to cleanup worktrees: %v", cleanupErr)
+		}
+	}()
+
+	d = d.WithWorktrees(worktrees)
+
+	var (
+		components  component.Components
+		discoverErr error
+	)
+
+	telemetryErr := telemetry.TelemeterFromContext(ctx).Collect(ctx, "find_discover", map[string]any{
+		"working_dir":  opts.WorkingDir,
+		"no_hidden":    opts.NoHidden,
+		"dependencies": opts.Dependencies,
+		"mode":         opts.Mode,
+		"exclude":      opts.Exclude,
+	}, func(ctx context.Context) error {
+		components, discoverErr = d.Discover(ctx, l, opts.TerragruntOptions)
+		return discoverErr
+	})
+	if telemetryErr != nil {
+		l.Debugf("Errors encountered while discovering components:\n%s", telemetryErr)
+	}
+
+	switch opts.Mode {
+	case ModeNormal:
+		components = components.Sort()
+	case ModeDAG:
+		err = telemetry.TelemeterFromContext(ctx).Collect(ctx, "find_mode_dag", map[string]any{
+			"working_dir":  opts.WorkingDir,
+			"config_count": len(components),
+		}, func(ctx context.Context) error {
+			q, queueErr := queue.NewQueue(components)
+			if queueErr != nil {
+				return queueErr
+			}
+
+			components = q.Components()
+
+			return nil
+		})
+		if err != nil {
+			return err
+		}
+	default:
+		// This should never happen, because of validation in the command.
+		// If it happens, we want to throw so we can fix the validation.
+		return errors.New("invalid mode: " + opts.Mode)
+	}
+
+	var foundComponents FoundComponents
+
+	err = telemetry.TelemeterFromContext(ctx).Collect(ctx, "find_discovered_to_found", map[string]any{
+		"working_dir":  opts.WorkingDir,
+		"config_count": len(components),
+	}, func(ctx context.Context) error {
+		foundComponents = discoveredToFound(l, components, opts)
+
+		return nil
+	})
+	if err != nil {
+		return err
+	}
+
+	switch opts.Format {
+	case FormatText:
+		return outputText(l, opts, foundComponents)
+	case FormatJSON:
+		return outputJSON(opts, foundComponents)
+	default:
+		// This should never happen, because of validation in the command.
+		// If it happens, we want to throw so we can fix the validation.
+		return errors.New("invalid format: " + opts.Format)
+	}
+}
+
+type FoundComponents []*FoundComponent
+
+type FoundComponent struct {
+	Type component.Kind `json:"type"`
+	Path string         `json:"path"`
+
+	Exclude *config.ExcludeConfig `json:"exclude,omitempty"`
+	Include map[string]string     `json:"include,omitempty"`
+
+	Dependencies []string `json:"dependencies,omitempty"`
+	Reading      []string `json:"reading,omitempty"`
+}
+
+func discoveredToFound(l log.Logger, components component.Components, opts *Options) FoundComponents {
+	foundComponents := make(FoundComponents, 0, len(components))
+
+	for _, c := range components {
+		if opts.QueueConstructAs != "" {
+			if unit, ok := c.(*component.Unit); ok {
+				if cfg := unit.Config(); cfg != nil && cfg.Exclude != nil {
+					if cfg.Exclude.IsActionListed(opts.QueueConstructAs) {
+						continue
+					}
+				}
+			}
+		}
+
+		base := opts.WorkingDir
+		if c.DiscoveryContext() != nil && c.DiscoveryContext().WorkingDir != "" {
+			base = c.DiscoveryContext().WorkingDir
+		}
+
+		foundComponent := &FoundComponent{
+			Type: c.Kind(),
+			Path: discovery.RelPathOrAbs(l, base, c.Path(), "component"),
+		}
+
+		if opts.Exclude {
+			if unit, ok := c.(*component.Unit); ok {
+				if cfg := unit.Config(); cfg != nil && cfg.Exclude != nil {
+					foundComponent.Exclude = cfg.Exclude.Clone()
+				}
+			}
+		}
+
+		if opts.Include {
+			if unit, ok := c.(*component.Unit); ok {
+				if cfg := unit.Config(); cfg != nil && cfg.ProcessedIncludes != nil {
+					foundComponent.Include = make(map[string]string, len(cfg.ProcessedIncludes))
+					for _, v := range cfg.ProcessedIncludes {
+						desc := fmt.Sprintf("include %q of unit %q", v.Name, unit.Path())
+						foundComponent.Include[v.Name] = discovery.RelPathOrAbs(l, opts.RootWorkingDir, v.Path, desc)
+					}
+				}
+			}
+		}
+
+		if opts.Reading && len(c.Reading()) > 0 {
+			foundComponent.Reading = make([]string, len(c.Reading()))
+
+			readingBase := opts.WorkingDir
+			if c.DiscoveryContext() != nil && c.DiscoveryContext().WorkingDir != "" {
+				readingBase = c.DiscoveryContext().WorkingDir
+			}
+
+			desc := fmt.Sprintf("read path of unit %q", c.Path())
+			for i, reading := range c.Reading() {
+				foundComponent.Reading[i] = discovery.RelPathOrAbs(l, readingBase, reading, desc)
+			}
+		}
+
+		if opts.Dependencies && len(c.Dependencies()) > 0 {
+			foundComponent.Dependencies = make([]string, len(c.Dependencies()))
+
+			desc := fmt.Sprintf("dependency of unit %q", c.Path())
+			for i, dep := range c.Dependencies() {
+				depBase := opts.WorkingDir
+				if dep.DiscoveryContext() != nil && dep.DiscoveryContext().WorkingDir != "" {
+					depBase = dep.DiscoveryContext().WorkingDir
+				}
+
+				foundComponent.Dependencies[i] = discovery.RelPathOrAbs(l, depBase, dep.Path(), desc)
+			}
+		}
+
+		foundComponents = append(foundComponents, foundComponent)
+	}
+
+	return foundComponents
+}
+
+// outputJSON outputs the discovered components in JSON format.
+func outputJSON(opts *Options, components FoundComponents) error {
+	jsonBytes, err := json.MarshalIndent(components, "", "  ")
+	if err != nil {
+		return err
+	}
+
+	_, err = opts.Writers.Writer.Write(append(jsonBytes, []byte("\n")...))
+	if err != nil {
+		return err
+	}
+
+	return nil
+}
+
+// Colorizer is a colorizer for the discovered components.
+type Colorizer struct {
+	unitColorizer  func(string) string
+	stackColorizer func(string) string
+	pathColorizer  func(string) string
+}
+
+// NewColorizer creates a new Colorizer.
+func NewColorizer(shouldColor bool) *Colorizer {
+	if !shouldColor {
+		return &Colorizer{
+			unitColorizer:  func(s string) string { return s },
+			stackColorizer: func(s string) string { return s },
+			pathColorizer:  func(s string) string { return s },
+		}
+	}
+
+	unitStyle := lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("12"))
+	stackStyle := lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("10"))
+	pathStyle := lipgloss.NewStyle().Faint(true).Foreground(lipgloss.Color("7"))
+
+	return &Colorizer{
+		unitColorizer:  func(s string) string { return unitStyle.Render(s) },
+		stackColorizer: func(s string) string { return stackStyle.Render(s) },
+		pathColorizer:  func(s string) string { return pathStyle.Render(s) },
+	}
+}
+
+func (c *Colorizer) Colorize(foundComponent *FoundComponent) string {
+	path := foundComponent.Path
+
+	// Get the directory and base name using filepath
+	dir, base := filepath.Split(path)
+
+	if dir == "" {
+		// No directory part, color the whole path
+		switch foundComponent.Type {
+		case component.UnitKind:
+			return c.unitColorizer(path)
+		case component.StackKind:
+			return c.stackColorizer(path)
+		default:
+			return path
+		}
+	}
+
+	// Color the components differently
+	coloredPath := c.pathColorizer(dir)
+
+	switch foundComponent.Type {
+	case component.UnitKind:
+		return coloredPath + c.unitColorizer(base)
+	case component.StackKind:
+		return coloredPath + c.stackColorizer(base)
+	default:
+		return path
+	}
+}
+
+// outputText outputs the discovered components in text format.
+func outputText(l log.Logger, opts *Options, components FoundComponents) error {
+	var buf strings.Builder
+
+	colorizer := NewColorizer(shouldColor(l))
+
+	for _, c := range components {
+		buf.WriteString(colorizer.Colorize(c) + "\n")
+	}
+
+	_, err := opts.Writers.Writer.Write([]byte(buf.String()))
+
+	return err
+}
+
+// shouldColor returns true if the output should be colored.
+func shouldColor(l log.Logger) bool {
+	return !l.Formatter().DisabledColors() && !stdout.IsRedirected()
+}

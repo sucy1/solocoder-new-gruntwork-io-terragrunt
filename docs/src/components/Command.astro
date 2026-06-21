@@ -1,0 +1,71 @@
+---
+import { Aside, Code } from '@astrojs/starlight/components';
+import { getEntry, render } from 'astro:content';
+import type { CollectionEntry } from 'astro:content';
+import Flag from './Flag.astro';
+import { isFlagVisible } from '@lib/flags';
+
+const { path } = Astro.props;
+
+const command = await getEntry('commands', path) as CollectionEntry<'commands'>;
+
+const data = command?.data;
+
+const usage = data?.usage;
+const { Content } = await render(command);
+
+const visibleFlagSlugs = data?.flags
+	? (
+			await Promise.all(
+				data.flags.map(async (slug) => {
+					const flag = await getEntry('flags', slug);
+					if (!flag) return null;
+					return (await isFlagVisible(flag.data.since)) ? slug : null;
+				}),
+			)
+		).filter((slug): slug is string => slug !== null)
+	: [];
+---
+
+{
+  data?.experiment ? (
+    <Aside type="tip" title={data?.experiment?.name}>
+      The <code dir="auto">{data?.name}</code> command is experimental, usage requires the <a href={"/reference/experiments/active#"+data?.experiment?.control}><code dir="auto">--experiment {data?.experiment?.control}</code></a> flag.
+    </Aside>
+  ) : null
+}
+
+<h2 id="usage">Usage</h2>
+
+{
+  usage?.split('\n').map((line) => (
+    <p>{line}</p>
+  ))
+}
+
+{
+  data?.examples ? (
+  <h2 id="examples">Examples</h2>
+  <div>
+    {data?.examples.map((example) => (
+      example && (
+        <p>{example?.description}</p>
+        <Code code={example?.code} lang="bash" />
+      )
+    ))}
+  </div>
+  ) : null
+}
+
+<Content />
+
+{
+  visibleFlagSlugs.length > 0 ? (
+  <h2 id="flags">Flags</h2>
+  <div>
+    {visibleFlagSlugs.map((flagSlug) => (
+      <Flag slug={flagSlug} />
+    ))}
+  </div>
+  ) : null
+}

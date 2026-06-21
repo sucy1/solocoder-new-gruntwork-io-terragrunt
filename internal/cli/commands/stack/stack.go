@@ -1,0 +1,205 @@
+package stack
+
+import (
+	"context"
+	"fmt"
+	"path/filepath"
+	"strings"
+
+	"github.com/gruntwork-io/terragrunt/internal/telemetry"
+	"github.com/zclconf/go-cty/cty"
+
+	"github.com/gruntwork-io/terragrunt/internal/runner/run"
+	"github.com/gruntwork-io/terragrunt/internal/runner/runall"
+	"github.com/gruntwork-io/terragrunt/pkg/config"
+	"github.com/gruntwork-io/terragrunt/pkg/log"
+
+	"github.com/gruntwork-io/terragrunt/internal/stacks/clean"
+	"github.com/gruntwork-io/terragrunt/internal/stacks/generate"
+	"github.com/gruntwork-io/terragrunt/internal/stacks/output"
+	"github.com/gruntwork-io/terragrunt/internal/tips"
+	"github.com/gruntwork-io/terragrunt/internal/vfs"
+	"github.com/gruntwork-io/terragrunt/internal/worktrees"
+	"github.com/gruntwork-io/terragrunt/pkg/options"
+)
+
+// RunGenerate runs the stack command.
+func RunGenerate(ctx context.Context, l log.Logger, opts *options.TerragruntOptions) error {
+	opts.TerragruntStackConfigPath = filepath.Join(opts.WorkingDir, config.DefaultStackFile)
+
+	if opts.NoStackGenerate {
+		l.Debugf("Skipping stack generation for %s", opts.TerragruntStackConfigPath)
+		return nil
+	}
+
+	tips.GiveStackTargetTip(l, vfs.NewOSFS(), opts.WorkingDir, opts.Filters, opts.Tips)
+
+	opts.StackAction = "generate"
+
+	// Clean stack folders before calling `generate` when the `--source-update` flag is passed
+	if opts.SourceUpdate {
+		err := telemetry.TelemeterFromContext(ctx).Collect(ctx, "stack_clean", map[string]any{
+			"stack_config_path": opts.TerragruntStackConfigPath,
+			"working_dir":       opts.WorkingDir,
+		}, func(ctx context.Context) error {
+			l.Debugf("Running stack clean for %s, as part of generate command", opts.WorkingDir)
+			return clean.CleanStacks(l, opts)
+		})
+		if err != nil {
+			return fmt.Errorf("failed to clean stack directories under %q: %w", opts.WorkingDir, err)
+		}
+	}
+
+	filters := opts.Filters
+
+	gitFilters := filters.UniqueGitFilters()
+
+	// Only create worktrees when git filter expressions are present
+	var wts *worktrees.Worktrees
+
+	if len(gitFilters) > 0 {
+		var err error
+
+		wts, err = worktrees.NewWorktrees(ctx, l, worktrees.WorktreeOpts{
+			WorkingDir:     opts.WorkingDir,
+			GitExpressions: gitFilters,
+			Experiments:    opts.Experiments,
+		})
+		if err != nil {
+			return fmt.Errorf("failed to create worktrees: %w", err)
+		}
+
+		defer func() {
+			cleanupErr := wts.Cleanup(ctx, l)
+			if cleanupErr != nil {
+				l.Errorf("failed to cleanup worktrees: %v", cleanupErr)
+			}
+		}()
+	}
+
+	gen := generate.NewGenerator()
+
+	return telemetry.TelemeterFromContext(ctx).Collect(ctx, "stack_generate", map[string]any{
+		"stack_config_path": opts.TerragruntStackConfigPath,
+		"working_dir":       opts.WorkingDir,
+	}, func(ctx context.Context) error {
+		return gen.GenerateStacks(ctx, l, opts, wts)
+	})
+}
+
+// Run executes the stack command.
+func Run(ctx context.Context, l log.Logger, v run.Venv, opts *options.TerragruntOptions) error {
+	opts.StackAction = "run"
+
+	err := telemetry.TelemeterFromContext(ctx).Collect(ctx, "stack_run", map[string]any{
+		"stack_config_path": opts.TerragruntStackConfigPath,
+		"working_dir":       opts.WorkingDir,
+	}, func(ctx context.Context) error {
+		return RunGenerate(ctx, l, opts)
+	})
+	if err != nil {
+		return err
+	}
+
+	return runall.Run(ctx, l, v, opts)
+}
+
+// RunOutput stack output.
+func RunOutput(ctx context.Context, l log.Logger, opts *options.TerragruntOptions, index string) error {
+	opts.StackAction = "output"
+	opts.TerraformCommand = "output" // required for discovery exclude action matching in StackOutput
+
+	var outputs cty.Value
+
+	// collect outputs
+	err := telemetry.TelemeterFromContext(ctx).Collect(ctx, "stack_output", map[string]any{
+		"stack_config_path": opts.TerragruntStackConfigPath,
+		"working_dir":       opts.WorkingDir,
+	}, func(ctx context.Context) error {
+		stackOutputs, err := output.StackOutput(ctx, l, opts)
+		outputs = stackOutputs
+
+		return err
+	})
+	if err != nil {
+		return err
+	}
+
+	// Filter outputs based on index key
+	filteredOutputs := FilterOutputs(outputs, index)
+
+	// render outputs
+
+	switch opts.StackOutputFormat {
+	default:
+		if err := PrintOutputs(opts.Writers.Writer, filteredOutputs); err != nil {
+			return err
+		}
+
+	case rawOutputFormat:
+		if err := PrintRawOutputs(opts, opts.Writers.Writer, filteredOutputs); err != nil {
+			return err
+		}
+
+	case jsonOutputFormat:
+		if err := PrintJSONOutput(opts.Writers.Writer, filteredOutputs); err != nil {
+			return err
+		}
+	}
+
+	return nil
+}
+
+// FilterOutputs filters the outputs based on the provided index key.
+func FilterOutputs(outputs cty.Value, index string) cty.Value {
+	if !outputs.IsKnown() || outputs.IsNull() || len(index) == 0 {
+		return outputs
+	}
+
+	// Split the index into parts
+	indexParts := strings.Split(index, ".")
+	// Traverse the map using the index parts
+	currentValue := outputs
+	for _, part := range indexParts {
+		// Check if the current value is a map or object
+		if currentValue.Type().IsObjectType() || currentValue.Type().IsMapType() {
+			valueMap := currentValue.AsValueMap()
+			if nextValue, exists := valueMap[part]; exists {
+				currentValue = nextValue
+			} else {
+				// If any part of the index path is not found, return NilVal
+				return cty.NilVal
+			}
+		} else {
+			// If the current value is not a map or object, return NilVal
+			return cty.NilVal
+		}
+	}
+
+	// Reconstruct the nested map structure
+	nested := currentValue
+	for i := len(indexParts) - 1; i >= 0; i-- {
+		nested = cty.ObjectVal(map[string]cty.Value{
+			indexParts[i]: nested,
+		})
+	}
+
+	return nested
+}
+
+// RunClean recursively removes all stack directories under the specified WorkingDir.
+func RunClean(ctx context.Context, l log.Logger, opts *options.TerragruntOptions) error {
+	telemeter := telemetry.TelemeterFromContext(ctx)
+
+	err := telemeter.Collect(ctx, "stack_clean", map[string]any{
+		"stack_config_path": opts.TerragruntStackConfigPath,
+		"working_dir":       opts.WorkingDir,
+	}, func(ctx context.Context) error {
+		return clean.CleanStacks(l, opts)
+	})
+	if err != nil {
+		return fmt.Errorf("failed to clean stack directories under %q: %w", opts.WorkingDir, err)
+	}
+
+	return nil
+}
